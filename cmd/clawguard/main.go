@@ -351,6 +351,17 @@ func dockerIDFromHostname() string {
 }
 
 func (cw *containerWatch) readLoop(ctx context.Context) {
+	// OpenSSL 3 stacks may hit both SSL_write and SSL_write_ex for one logical write.
+	// Keep a tiny dedup window to avoid printing the exact same payload twice.
+	var (
+		lastPID     uint32
+		lastLen     uint32
+		lastN       uint32
+		lastPayload [maxPayload]byte
+		lastAt      time.Time
+		haveLast    bool
+	)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -381,6 +392,23 @@ func (cw *containerWatch) readLoop(ctx context.Context) {
 			n = maxPayload
 		}
 		payload := ev.Payload[:n]
+
+		if haveLast &&
+			ev.PID == lastPID &&
+			ev.Len == lastLen &&
+			n == lastN &&
+			time.Since(lastAt) <= 2*time.Millisecond &&
+			bytes.Equal(payload, lastPayload[:n]) {
+			debugLog("dedup identical event pid=%d len=%d", ev.PID, ev.Len)
+			continue
+		}
+
+		lastPID = ev.PID
+		lastLen = ev.Len
+		lastN = n
+		copy(lastPayload[:], ev.Payload[:])
+		lastAt = time.Now()
+		haveLast = true
 		log.Printf("pid=%d len=%d payload=%q", ev.PID, ev.Len, sanitizeUTF8(payload))
 	}
 }
@@ -550,9 +578,14 @@ func (cw *containerWatch) attachContainer(ctx context.Context, cli *client.Clien
 func discoverLibSSLUnderProcRoot(rootPID int) (string, error) {
 	procRoot := fmt.Sprintf("/proc/%d/root", rootPID)
 	candidates := []string{
+		"lib/libssl.so.3",
+		"lib64/libssl.so.3",
+		"lib/x86_64-linux-gnu/libssl.so.3",
+		"lib/aarch64-linux-gnu/libssl.so.3",
 		"usr/lib/x86_64-linux-gnu/libssl.so.3",
 		"usr/lib/aarch64-linux-gnu/libssl.so.3",
 		"usr/lib/libssl.so.3",
+		"usr/local/lib/libssl.so.3",
 	}
 	for _, rel := range candidates {
 		p := filepath.Join(procRoot, rel)
@@ -560,23 +593,30 @@ func discoverLibSSLUnderProcRoot(rootPID int) (string, error) {
 			return p, nil
 		}
 	}
-	libDir := filepath.Join(procRoot, "usr", "lib")
-	var found string
-	_ = filepath.Walk(libDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
-			return nil
-		}
-		name := filepath.Base(path)
-		if strings.HasPrefix(name, "libssl.so") {
-			found = path
-			return filepath.SkipAll
-		}
-		return nil
-	})
-	if found != "" {
-		return found, nil
+	searchRoots := []string{
+		filepath.Join(procRoot, "usr", "lib"),
+		filepath.Join(procRoot, "lib"),
+		filepath.Join(procRoot, "lib64"),
+		filepath.Join(procRoot, "usr", "local", "lib"),
 	}
-	return "", fmt.Errorf("libssl.so not found under %s/usr/lib", procRoot)
+	for _, dir := range searchRoots {
+		var found string
+		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() {
+				return nil
+			}
+			name := filepath.Base(path)
+			if strings.HasPrefix(name, "libssl.so") {
+				found = path
+				return filepath.SkipAll
+			}
+			return nil
+		})
+		if found != "" {
+			return found, nil
+		}
+	}
+	return "", fmt.Errorf("libssl.so not found under %s/{usr/lib,lib,lib64,usr/local/lib}", procRoot)
 }
 
 func (cw *containerWatch) detachContainer(containerID string) {

@@ -48,10 +48,10 @@ Running the monitor still requires **elevated privileges** on the Linux host/VM 
 
 ### 4.1 Pull and run the monitor
 
-2. **Pull** (Docker selects **amd64** or **arm64** to match your engine when the manifest is multi-arch):
+2. **Pull** (Docker selects **amd64** or **arm64** to match your engine when the manifest is multi-arch), See [Dockerhub](https://hub.docker.com/repository/docker/eyelessly/clawguard):
 
    ```bash
-   docker pull pull docker.io/eyelessly/clawguard:latest
+   docker pull eyelessly/clawguard:latest
    ```
 
 3. **Run** the monitor:
