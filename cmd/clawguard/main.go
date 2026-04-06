@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,14 +28,43 @@ import (
 
 // Matches struct ssl_event in bpf/ssl_write.bpf.c (packed layout, no padding between fields).
 type sslEvent struct {
-	PID     uint32
-	Len     uint32
-	Payload [256]byte
+	PID       uint32
+	TID       uint32
+	CallID    uint32
+	OrigLen   uint32
+	TotalLen  uint32
+	Truncated uint32
+	FragIdx   uint32
+	FragCnt   uint32
+	ChunkLen  uint32
+	HookType  uint32
+	Payload   [512]byte
 }
 
-const maxPayload = 256
+const (
+	maxChunkPayload = 512
+	maxCaptureBytes = 16384
+	reassemblyTTL   = 2 * time.Second
+)
+
+type reassemblyKey struct {
+	PID    uint32
+	TID    uint32
+	CallID uint32
+}
+
+type reassemblyState struct {
+	origLen   uint32
+	totalLen  uint32
+	truncated bool
+	fragCnt   uint32
+	frags     map[uint32][]byte
+	firstAt   time.Time
+	lastAt    time.Time
+}
 
 var debugLog = func(format string, args ...any) {}
+var logPayloadMaxBytes = maxCaptureBytes
 
 func init() {
 	if os.Getenv("CLAWGUARD_DEBUG") != "" {
@@ -42,6 +72,28 @@ func init() {
 			log.Printf("[debug] "+format, args...)
 		}
 	}
+	logPayloadMaxBytes = parseLogPayloadMax(os.Getenv("CLAWGUARD_PAYLOAD_PREVIEW_MAX"))
+}
+
+func parseLogPayloadMax(v string) int {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return maxCaptureBytes
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("warning: CLAWGUARD_PAYLOAD_PREVIEW_MAX=%q invalid, fallback to %d", v, maxCaptureBytes)
+		return maxCaptureBytes
+	}
+	if n < 0 {
+		log.Printf("warning: CLAWGUARD_PAYLOAD_PREVIEW_MAX=%q negative, fallback to %d", v, maxCaptureBytes)
+		return maxCaptureBytes
+	}
+	if n > maxCaptureBytes {
+		log.Printf("warning: CLAWGUARD_PAYLOAD_PREVIEW_MAX=%d exceeds cap %d, using %d", n, maxCaptureBytes, maxCaptureBytes)
+		return maxCaptureBytes
+	}
+	return n
 }
 
 // parseLabelFilter parses CLAWGUARD_LABEL: comma-separated key=value pairs (AND).
@@ -125,12 +177,12 @@ type labelPair struct {
 }
 
 type containerWatch struct {
-	mu               sync.Mutex
-	byID             map[string]*attachSet
-	objs             *ssl_writeObjects
-	ringReader       *ringbuf.Reader
-	selfContainerID  string // 12- or 64-hex; skip attaching to ourselves (cgroup, hostname, or Docker API pid match)
-	labelPairs       []labelPair // empty = monitor all non-self; non-empty = AND match on container labels
+	mu              sync.Mutex
+	byID            map[string]*attachSet
+	objs            *ssl_writeObjects
+	ringReader      *ringbuf.Reader
+	selfContainerID string      // 12- or 64-hex; skip attaching to ourselves (cgroup, hostname, or Docker API pid match)
+	labelPairs      []labelPair // empty = monitor all non-self; non-empty = AND match on container labels
 }
 
 type attachSet struct {
@@ -148,6 +200,7 @@ func main() {
 		log.Println("warning: not running as root; eBPF uprobe attach usually requires privileges")
 	}
 	log.Printf("pid=%d CLAWGUARD_DEBUG=%q", os.Getpid(), os.Getenv("CLAWGUARD_DEBUG"))
+	log.Printf("CLAWGUARD_PAYLOAD_PREVIEW_MAX=%d (display-only cap)", logPayloadMaxBytes)
 	logRuntimeContext()
 
 	dockerSock := "unix:///var/run/docker.sock"
@@ -199,11 +252,11 @@ func main() {
 	}
 
 	cw := &containerWatch{
-		byID:              make(map[string]*attachSet),
-		objs:              objs,
-		ringReader:        rd,
-		selfContainerID:   selfID,
-		labelPairs:        labelPairs,
+		byID:            make(map[string]*attachSet),
+		objs:            objs,
+		ringReader:      rd,
+		selfContainerID: selfID,
+		labelPairs:      labelPairs,
 	}
 
 	go cw.readLoop(ctx)
@@ -351,16 +404,8 @@ func dockerIDFromHostname() string {
 }
 
 func (cw *containerWatch) readLoop(ctx context.Context) {
-	// OpenSSL 3 stacks may hit both SSL_write and SSL_write_ex for one logical write.
-	// Keep a tiny dedup window to avoid printing the exact same payload twice.
-	var (
-		lastPID     uint32
-		lastLen     uint32
-		lastN       uint32
-		lastPayload [maxPayload]byte
-		lastAt      time.Time
-		haveLast    bool
-	)
+	reassemblies := make(map[reassemblyKey]*reassemblyState)
+	lastCleanup := time.Now()
 
 	for {
 		select {
@@ -387,29 +432,90 @@ func (cw *containerWatch) readLoop(ctx context.Context) {
 			log.Printf("decode event: %v", err)
 			continue
 		}
-		n := ev.Len
-		if n > maxPayload {
-			n = maxPayload
-		}
-		payload := ev.Payload[:n]
-
-		if haveLast &&
-			ev.PID == lastPID &&
-			ev.Len == lastLen &&
-			n == lastN &&
-			time.Since(lastAt) <= 2*time.Millisecond &&
-			bytes.Equal(payload, lastPayload[:n]) {
-			debugLog("dedup identical event pid=%d len=%d", ev.PID, ev.Len)
+		if ev.FragCnt == 0 || ev.FragIdx >= ev.FragCnt {
+			debugLog("drop invalid fragment pid=%d tid=%d call=%d frag=%d/%d", ev.PID, ev.TID, ev.CallID, ev.FragIdx, ev.FragCnt)
 			continue
 		}
+		n := ev.ChunkLen
+		if n > maxChunkPayload {
+			n = maxChunkPayload
+		}
+		if n == 0 {
+			debugLog("drop empty fragment pid=%d tid=%d call=%d frag=%d/%d", ev.PID, ev.TID, ev.CallID, ev.FragIdx, ev.FragCnt)
+			continue
+		}
+		payload := append([]byte(nil), ev.Payload[:n]...)
 
-		lastPID = ev.PID
-		lastLen = ev.Len
-		lastN = n
-		copy(lastPayload[:], ev.Payload[:])
-		lastAt = time.Now()
-		haveLast = true
-		log.Printf("pid=%d len=%d payload=%q", ev.PID, ev.Len, sanitizeUTF8(payload))
+		key := reassemblyKey{PID: ev.PID, TID: ev.TID, CallID: ev.CallID}
+		st := reassemblies[key]
+		if st == nil {
+			st = &reassemblyState{
+				origLen:   ev.OrigLen,
+				totalLen:  ev.TotalLen,
+				truncated: ev.Truncated != 0,
+				fragCnt:   ev.FragCnt,
+				frags:     make(map[uint32][]byte, ev.FragCnt),
+				firstAt:   time.Now(),
+			}
+			reassemblies[key] = st
+		}
+		st.lastAt = time.Now()
+		if ev.OrigLen > st.origLen {
+			st.origLen = ev.OrigLen
+		}
+		if ev.TotalLen > st.totalLen {
+			st.totalLen = ev.TotalLen
+		}
+		if ev.Truncated != 0 {
+			st.truncated = true
+		}
+
+		// Deduplicate dual-hook duplicates: same call_id + same fragment index + same bytes.
+		if prev, ok := st.frags[ev.FragIdx]; ok {
+			if bytes.Equal(prev, payload) {
+				debugLog("dedup fragment pid=%d tid=%d call=%d frag=%d hook=%d", ev.PID, ev.TID, ev.CallID, ev.FragIdx, ev.HookType)
+				goto maybeCleanup
+			}
+			// Keep first fragment for deterministic reassembly; record collision for debugging.
+			debugLog("fragment collision pid=%d tid=%d call=%d frag=%d old=%d new=%d", ev.PID, ev.TID, ev.CallID, ev.FragIdx, len(prev), len(payload))
+			goto maybeCleanup
+		}
+		st.frags[ev.FragIdx] = payload
+
+		if uint32(len(st.frags)) == st.fragCnt {
+			var assembled bytes.Buffer
+			for i := uint32(0); i < st.fragCnt; i++ {
+				frag, ok := st.frags[i]
+				if !ok {
+					debugLog("missing fragment after complete-count pid=%d tid=%d call=%d idx=%d", ev.PID, ev.TID, ev.CallID, i)
+					goto maybeCleanup
+				}
+				assembled.Write(frag)
+			}
+			out := assembled.Bytes()
+			if st.totalLen > 0 && uint32(len(out)) > st.totalLen {
+				out = out[:st.totalLen]
+			}
+			log.Printf(
+				"pid=%d tid=%d call=%d reassembled_len=%d orig_len=%d captured_len=%d truncated=%t frags=%d payload=%q",
+				ev.PID, ev.TID, ev.CallID, len(out), st.origLen, st.totalLen, st.truncated, st.fragCnt, formatPayloadForLog(out),
+			)
+			delete(reassemblies, key)
+		}
+
+	maybeCleanup:
+		if time.Since(lastCleanup) < time.Second {
+			continue
+		}
+		now := time.Now()
+		for k, v := range reassemblies {
+			if now.Sub(v.lastAt) <= reassemblyTTL {
+				continue
+			}
+			log.Printf("reassembly timeout pid=%d tid=%d call=%d have=%d/%d first_seen_ms=%d", k.PID, k.TID, k.CallID, len(v.frags), v.fragCnt, now.Sub(v.firstAt).Milliseconds())
+			delete(reassemblies, k)
+		}
+		lastCleanup = now
 	}
 }
 
@@ -419,6 +525,16 @@ func sanitizeUTF8(b []byte) string {
 		return s
 	}
 	return strings.ToValidUTF8(s, "\uFFFD")
+}
+
+func formatPayloadForLog(b []byte) string {
+	if logPayloadMaxBytes >= len(b) {
+		return sanitizeUTF8(b)
+	}
+	if logPayloadMaxBytes == 0 {
+		return "..."
+	}
+	return sanitizeUTF8(b[:logPayloadMaxBytes]) + "..."
 }
 
 func (cw *containerWatch) scanRunning(ctx context.Context, cli *client.Client) error {

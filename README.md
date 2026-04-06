@@ -110,7 +110,7 @@ Build the image locally once, then use your local tag everywhere instead of the 
 ## 5. How it works (mechanism, short)
 
 - eBPF programs attach **uprobes** to the agent container’s `libssl.so` for **`SSL_write`** and **`SSL_write_ex`** (Python 3.10+ uses `_ex`).
-- A **ring buffer** carries small plaintext slices (cap **256 bytes** per event) to user space; the Go process logs them.
+- A **ring buffer** carries plaintext **fragments** (fixed **512 bytes** per fragment, up to **16384 bytes** total per logical write in current build) to user space; the Go process reassembles and logs payloads.
 - The monitor subscribes to Docker **start** / **die** / **destroy** and attaches/detaches accordingly; it skips itself via cgroup / hostname / API PID match.
 
 **Runtime:** Linux kernel only (Docker Desktop VM or Linux host). Image arch must match the engine (**amd64** / **arm64**).
@@ -155,4 +155,6 @@ sudo ./bin/clawguard
 ## 7. Limitations
 
 - **OpenSSL dynamic linking** only (`SSL_write` / `SSL_write_ex`). Not BoringSSL, not typical fully static Go `crypto/tls` without symbols.
-- **256-byte** cap per captured chunk in BPF; longer bodies appear truncated in the log (length may still be reported up to that cap).
+- Reassembly is bounded: up to **16384 bytes** per logical write in current stage; larger writes are truncated.
+- Reassembly timeout is short (2s): if fragments are dropped under heavy pressure, a timeout log is emitted and that payload is discarded.
+- Truncation is explicit in logs with `truncated=true`, plus `orig_len` and `captured_len` for auditability.
