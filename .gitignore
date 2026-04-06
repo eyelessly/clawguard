@@ -1,0 +1,5 @@
+/bin/
+cmd/clawguard/ssl_write_bpfel.go
+cmd/clawguard/ssl_write_bpfeb.go
+cmd/clawguard/ssl_write_bpfel.o
+cmd/clawguard/ssl_write_bpfeb.o

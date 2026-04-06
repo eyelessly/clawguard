@@ -1,0 +1,81 @@
+# Native Linux binaries per arch (scheme A): clang + bpf2go + go build on matching runners.
+
+name: Release Linux binaries
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs_on: ubuntu-latest
+            goarch: amd64
+            artifact_suffix: linux-amd64
+          - runs_on: ubuntu-24.04-arm
+            goarch: arm64
+            artifact_suffix: linux-arm64
+
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+          cache: true
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev
+
+      - name: Generate BPF and build
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          make generate
+          mkdir -p bin
+          go build -trimpath -ldflags "-s -w" -o bin/clawguard ./cmd/clawguard
+          file bin/clawguard
+
+      - name: Package
+        run: |
+          ver="${GITHUB_REF_NAME}"
+          base="clawguard_${ver}_${{ matrix.artifact_suffix }}"
+          tar czf "${base}.tar.gz" -C bin clawguard
+          sha256sum "${base}.tar.gz" > "${base}.tar.gz.sha256"
+          cat "${base}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_suffix }}
+          path: |
+            clawguard_*.tar.gz
+            clawguard_*.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
