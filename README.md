@@ -48,48 +48,40 @@ Running the monitor still requires **elevated privileges** on the Linux host/VM 
 
 ### 4.1 Pull and run the monitor
 
-1. **Choose the image** (replace placeholders with your org/user; tags may be `latest`, `main`, or a version):
-
-   ```bash
-   # Docker Hub (typical)
-   export CLAWGUARD_IMAGE=docker.io/YOUR_DOCKERHUB_USER/clawguard:latest
-
-   # Or GitHub Container Registry
-   # export CLAWGUARD_IMAGE=ghcr.io/your-org/clawguard:main
-   ```
-
 2. **Pull** (Docker selects **amd64** or **arm64** to match your engine when the manifest is multi-arch):
 
    ```bash
-   docker pull "$CLAWGUARD_IMAGE"
+   docker pull pull docker.io/eyelessly/clawguard:latest
    ```
 
 3. **Run** the monitor:
 
    ```bash
-   docker rm -f clawguard-manager 2>/dev/null
-   docker run -d --name clawguard-manager \
+   docker rm -f clawguard 2>/dev/null
+   docker run -d --name clawguard \
      --privileged --pid=host --net=host \
      -v /var/run/docker.sock:/var/run/docker.sock \
-     "$CLAWGUARD_IMAGE"
-   docker logs -f clawguard-manager
+     eyelessly/clawguard:latest
+
+   docker logs -f clawguard
    ```
 
-You should see **`BPF collection loaded OK`** and **`ClawGuard: listening`**. **Ctrl+C** stops following logs; use `docker logs -f clawguard-manager` again anytime.
+You should see **`BPF collection loaded OK`** and **`ClawGuard: listening`**. **Ctrl+C** stops following logs; use `docker logs -f clawguard` again anytime.
 
 ### 4.2 Verify in ~30 seconds (labeled agent)
 
-**Terminal A** — monitor **only** containers with `clawguard.monitor=true` (reuse the same `CLAWGUARD_IMAGE`):
+**Terminal A** — monitor **only** containers with `clawguard.monitor=true`:
 
 ```bash
-docker rm -f clawguard-manager
-docker run -d --name clawguard-manager \
+docker rm -f clawguard
+docker run -d --name clawguard \
   --privileged --pid=host --net=host \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e CLAWGUARD_LABEL=clawguard.monitor=true \
   -e CLAWGUARD_DEBUG=1 \
-  "$CLAWGUARD_IMAGE"
-docker logs -f clawguard-manager
+  eyelessly/clawguard:latest
+
+docker logs -f clawguard
 ```
 
 **Terminal B** — run a one-off “agent” with the same label:
@@ -101,11 +93,11 @@ docker run --rm --label clawguard.monitor=true python:3.11-slim bash -ec '
 '
 ```
 
-In **Terminal A** you should see log lines with `payload=` containing `MY_SECRET_PASSWORD_123` (possibly among other TLS writes). When done: **Ctrl+C**, then `docker rm -f clawguard-manager`.
+In **Terminal A** you should see log lines with `payload=` containing `MY_SECRET_PASSWORD_123` (possibly among other TLS writes). When done: **Ctrl+C**, then `docker rm -f clawguard`.
 
 ### 4.3 No published image yet?
 
-Build the image locally once, then use your local tag everywhere instead of `CLAWGUARD_IMAGE` (see **§6.1**). You need a **git clone** of this repo only for that path.
+Build the image locally once, then use your local tag everywhere instead of the Dockerhub's image (see **§6.1**). You need a **git clone** of this repo only for that path.
 
 ### 4.4 Fit into *your* Docker setup
 
@@ -134,10 +126,11 @@ Use this when you **modify code**, or when **no pre-built image** is available y
 **You do not run `make build` on the host before this.** The `Dockerfile` already runs `make generate` and compiles the Go binary **inside** the build stage, so `docker build` (or `make docker-build` below) is enough.
 
 ```bash
-git clone https://github.com/YOUR_ORG/clawguard.git
+git clone https://github.com/eyelesly/clawguard.git
 cd clawguard
 
 docker build -t clawguard-https-demo .
+
 # or load a single-arch image with buildx (--load requires one platform):
 make docker-info
 make docker-build IMAGE=clawguard-https-demo
@@ -152,20 +145,10 @@ Override platform explicitly if needed: `make docker-build-amd64` or `make docke
 Requires `clang`, `llvm`, `libbpf-dev`, Go **1.22+**. The Makefile sets **BPF arch from `uname -m`** (`x86_64` / `aarch64` / `arm64`).
 
 ```bash
+# Linux Only
 make build
 sudo ./bin/clawguard
 ```
-
-### 6.3 Where pre-built images come from
-
-CI builds multi-arch images and pushes to **GHCR** and (if you set secrets) **Docker Hub**—same **`docker pull`** flow as **§4.1**. Optional repository secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`.
-
-### 6.4 CI/CD (this repo)
-
-- **`.github/workflows/docker-publish.yml`** — multi-arch image; push on `main` / tags; PRs build only.
-- **`.github/workflows/release-binaries.yml`** — on `v*` tags, native Linux **amd64** / **arm64** tarballs (public repos: `ubuntu-24.04-arm` for arm64).
-
-When this folder is the **Git root**, `.github/workflows/` is at the repo root.
 
 ---
 
