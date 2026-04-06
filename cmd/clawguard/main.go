@@ -540,7 +540,40 @@ func (cw *containerWatch) attachContainer(ctx context.Context, cli *client.Clien
 		time.Sleep(delay)
 	}
 	if lib == "" || discoverErr != nil {
-		log.Printf("container %s: no libssl.so under /proc/%d/root: %v", shortID(containerID), rootPID, discoverErr)
+		// Some runtimes (notably certain Node builds) may statically link OpenSSL,
+		// so there is no standalone libssl.so in the container filesystem.
+		// Fallback: try attaching directly to the node executable if present.
+		if nodeExe, nodeErr := discoverNodeExecutableUnderProcRoot(rootPID); nodeErr == nil && nodeExe != "" {
+			exe, err := link.OpenExecutable(nodeExe)
+			if err != nil {
+				log.Printf("container %s: open node executable %s: %v", shortID(containerID), nodeExe, err)
+				return
+			}
+			lw, err := exe.Uprobe("SSL_write", cw.objs.ProbeSslWrite, nil)
+			if err != nil {
+				log.Printf("container %s: uprobe SSL_write on node %s: %v", shortID(containerID), nodeExe, err)
+				return
+			}
+			lex, err := exe.Uprobe("SSL_write_ex", cw.objs.ProbeSslWriteEx, nil)
+			if err != nil {
+				_ = lw.Close()
+				log.Printf("container %s: uprobe SSL_write_ex on node %s: %v", shortID(containerID), nodeExe, err)
+				return
+			}
+			log.Printf("attached SSL_write + SSL_write_ex uprobes on node executable: container=%s exe=%s", shortID(containerID), nodeExe)
+
+			cw.mu.Lock()
+			defer cw.mu.Unlock()
+			if _, ok := cw.byID[containerID]; ok {
+				_ = lw.Close()
+				_ = lex.Close()
+				return
+			}
+			cw.byID[containerID] = &attachSet{links: []link.Link{lw, lex}}
+			return
+		}
+
+		log.Printf("container %s: no libssl.so under /proc/%d/root (and no node executable fallback): %v", shortID(containerID), rootPID, discoverErr)
 		return
 	}
 
@@ -617,6 +650,50 @@ func discoverLibSSLUnderProcRoot(rootPID int) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("libssl.so not found under %s/{usr/lib,lib,lib64,usr/local/lib}", procRoot)
+}
+
+// discoverNodeExecutableUnderProcRoot finds a likely node binary path for static-OpenSSL fallback.
+func discoverNodeExecutableUnderProcRoot(rootPID int) (string, error) {
+	procRoot := fmt.Sprintf("/proc/%d/root", rootPID)
+	candidates := []string{
+		"usr/local/bin/node",
+		"usr/bin/node",
+		"usr/bin/nodejs",
+		"bin/node",
+		"bin/nodejs",
+	}
+	for _, rel := range candidates {
+		p := filepath.Join(procRoot, rel)
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p, nil
+		}
+	}
+
+	// Fallback: bounded walk through common roots for custom Node layouts.
+	searchRoots := []string{
+		filepath.Join(procRoot, "usr"),
+		filepath.Join(procRoot, "usr", "local"),
+		filepath.Join(procRoot, "bin"),
+		filepath.Join(procRoot, "opt"),
+	}
+	for _, root := range searchRoots {
+		var found string
+		_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() {
+				return nil
+			}
+			name := filepath.Base(path)
+			if name == "node" || name == "nodejs" {
+				found = path
+				return filepath.SkipAll
+			}
+			return nil
+		})
+		if found != "" {
+			return found, nil
+		}
+	}
+	return "", fmt.Errorf("node executable not found under %s/{usr/local/bin,usr/bin,bin,usr,opt}", procRoot)
 }
 
 func (cw *containerWatch) detachContainer(containerID string) {
