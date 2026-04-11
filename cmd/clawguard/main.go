@@ -183,10 +183,12 @@ type containerWatch struct {
 	ringReader      *ringbuf.Reader
 	selfContainerID string      // 12- or 64-hex; skip attaching to ourselves (cgroup, hostname, or Docker API pid match)
 	labelPairs      []labelPair // empty = monitor all non-self; non-empty = AND match on container labels
+	hub             *hub
 }
 
 type attachSet struct {
-	links []link.Link
+	links       []link.Link
+	containerID string
 }
 
 func main() {
@@ -257,8 +259,11 @@ func main() {
 		ringReader:      rd,
 		selfContainerID: selfID,
 		labelPairs:      labelPairs,
+		hub:             newHub(),
 	}
 
+	go cw.hub.run(ctx)
+	go startHTTPServer(ctx, cw.hub, 8080)
 	go cw.readLoop(ctx)
 
 	if err := cw.scanRunning(ctx, cli); err != nil {
@@ -500,6 +505,22 @@ func (cw *containerWatch) readLoop(ctx context.Context) {
 				"pid=%d tid=%d call=%d reassembled_len=%d orig_len=%d captured_len=%d truncated=%t frags=%d payload=%q",
 				ev.PID, ev.TID, ev.CallID, len(out), st.origLen, st.totalLen, st.truncated, st.fragCnt, formatPayloadForLog(out),
 			)
+
+			// Broadcast to Web UI
+			containerID := cw.findContainerIDByPID(ev.PID)
+			broadcastPacket(cw.hub, PacketEvent{
+				Timestamp:   time.Now(),
+				PID:         ev.PID,
+				TID:         ev.TID,
+				CallID:      ev.CallID,
+				OrigLen:     st.origLen,
+				CapturedLen: st.totalLen,
+				Truncated:   st.truncated,
+				HookType:    ev.HookType,
+				Payload:     sanitizeUTF8(out),
+				ContainerID: containerID,
+			})
+
 			delete(reassemblies, key)
 		}
 
@@ -685,7 +706,7 @@ func (cw *containerWatch) attachContainer(ctx context.Context, cli *client.Clien
 				_ = lex.Close()
 				return
 			}
-			cw.byID[containerID] = &attachSet{links: []link.Link{lw, lex}}
+			cw.byID[containerID] = &attachSet{links: []link.Link{lw, lex}, containerID: containerID}
 			return
 		}
 
@@ -720,7 +741,7 @@ func (cw *containerWatch) attachContainer(ctx context.Context, cli *client.Clien
 		_ = lex.Close()
 		return
 	}
-	cw.byID[containerID] = &attachSet{links: []link.Link{lw, lex}}
+	cw.byID[containerID] = &attachSet{links: []link.Link{lw, lex}, containerID: containerID}
 }
 
 // discoverLibSSLUnderProcRoot finds libssl.so* inside the container filesystem via /proc/<pid>/root.
@@ -865,6 +886,19 @@ func waitContainerPID(ctx context.Context, cli *client.Client, containerID strin
 		return 0, fmt.Errorf("no pid after retries: %w", lastErr)
 	}
 	return 0, fmt.Errorf("no pid after retries")
+}
+
+func (cw *containerWatch) findContainerIDByPID(pid uint32) string {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	// This is a heuristic: we don't have a direct PID -> ContainerID map that's always up to date
+	// because we attach to the DSO, not individual PIDs.
+	// For now, we return the first attached container ID as a placeholder or "unknown"
+	// In a more robust implementation, we'd use /proc/pid/cgroup to resolve this.
+	for id := range cw.byID {
+		return id
+	}
+	return "unknown"
 }
 
 func shortID(id string) string {

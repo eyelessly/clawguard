@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+:root {
+  --wireshark-bg: #f0f0f0;
+  --wireshark-header: #e1e1e1;
+  --wireshark-selected: #0078d7;
+  --wireshark-selected-text: #ffffff;
+}
+
+body {
+  @apply bg-gray-100 text-gray-900 overflow-hidden h-screen;
+}
+
+#root {
+  @apply h-full;
+}
+
+.wireshark-table-header {
+  @apply bg-gray-200 border-b border-gray-300 text-xs font-semibold text-gray-600 uppercase tracking-wider;
+}
+
+.wireshark-row {
+  @apply border-b border-gray-200 hover:bg-blue-50 cursor-pointer text-sm font-mono;
+}
+
+.wireshark-row.selected {
+  @apply bg-blue-600 text-white hover:bg-blue-600;
+}

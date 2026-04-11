@@ -1,4 +1,11 @@
 # Build must match the Linux kernel arch that loads the BPF program (Docker Desktop VM).
+FROM node:20-slim AS frontend-builder
+WORKDIR /ui
+COPY ui/package*.json ./
+RUN npm install
+COPY ui/ ./
+RUN npm run build
+
 FROM golang:1.22-bookworm AS builder
 
 ARG TARGETARCH
@@ -23,4 +30,6 @@ RUN case "$TARGETARCH" in \
 FROM debian:bookworm-slim
 RUN apt-get update -qq && apt-get install -y -qq ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/clawguard /usr/local/bin/clawguard
+COPY --from=frontend-builder /ui/dist /ui/dist
+WORKDIR /
 ENTRYPOINT ["/usr/local/bin/clawguard"]
