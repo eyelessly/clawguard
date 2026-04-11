@@ -40,51 +40,55 @@ Running the monitor still requires **elevated privileges** on the Linux host/VM 
 
 ---
 
-## 4. Quick start and quick verification
+## 4. Web UI & Quick Start
 
-**Prerequisites:** [Docker](https://docs.docker.com/get-docker/) running (on macOS/Windows use **Docker Desktop**; eBPF runs in the Linux VM).
+ClawGuard features a built-in **Wireshark-inspired Web UI** for real-time monitoring and historical audit.
 
-**Recommended path:** pull a **pre-built multi-arch image** (no `git clone`, no local build). CI publishes to **Docker Hub** and/or **GHCR**—use whichever your project documents after release.
+![ClawGuard UI](clawguard-ui.png)
 
-### 4.1 Pull and run the monitor
+### 4.1 Features
+- **Real-time Streaming**: Capture and display TLS plaintext as it happens via WebSockets.
+- **Deep Inspection**: Metadata view including Container ID, PID, TID, and eBPF hook details.
+- **Hex Dump View**: Professional 16-column Hex + ASCII display for binary payloads.
+- **Dark Mode**: Fully optimized dark theme for low-light environments.
+- **Adjustable Layout**: Interactive splitters to resize the packet list, details, and hex view.
+- **Export**: One-click JSON export for further analysis.
 
-2. **Pull** (Docker selects **amd64** or **arm64** to match your engine when the manifest is multi-arch), See [Dockerhub](https://hub.docker.com/r/eyelessly/clawguard):
+### 4.2 Run the Monitor with Web UI
 
+1. **Pull** the image:
    ```bash
    docker pull eyelessly/clawguard:latest
    ```
 
-3. **Run** the monitor:
-
+2. **Run** the monitor with port mapping (8080):
    ```bash
    docker rm -f clawguard 2>/dev/null
    docker run -d --name clawguard \
-     --privileged --pid=host --net=host \
+     --privileged --pid=host \
+     -p 8080:8080 \
      -v /var/run/docker.sock:/var/run/docker.sock \
+     -e CLAWGUARD_LABEL=clawguard.monitor=true \
      eyelessly/clawguard:latest
-
-   docker logs -f clawguard
    ```
 
-You should see **`BPF collection loaded OK`** and **`ClawGuard: listening`**. **Ctrl+C** stops following logs; use `docker logs -f clawguard` again anytime.
+3. **IMPORTANT: Label your Agents!**
+   ClawGuard only captures traffic from containers that have the matching label. When starting your AI agent or any target container, you **must** add:
+   ```bash
+   docker run --label clawguard.monitor=true ...
+   ```
 
-### 4.2 Verify in ~30 seconds (labeled agent)
+4. **Access**: Open [http://localhost:8080](http://localhost:8080) in your browser.
 
-**Terminal A** — monitor **only** containers with `clawguard.monitor=true`:
+---
 
-```bash
-docker rm -f clawguard
-docker run -d --name clawguard \
-  --privileged --pid=host --net=host \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -e CLAWGUARD_LABEL=clawguard.monitor=true \
-  -e CLAWGUARD_DEBUG=1 \
-  eyelessly/clawguard:latest
+## 5. Quick Verification
 
-docker logs -f clawguard
-```
+You can verify the system either through the **Web UI** or **CLI**.
 
-**Terminal B** — run a one-off “agent” with the same label:
+### 5.1 Verify with a Test Agent (UI)
+
+Once the monitor is running and you have opened the Web UI at `localhost:8080`, run this command to see live capture:
 
 ```bash
 docker run --rm --label clawguard.monitor=true python:3.11-slim bash -ec '
@@ -92,25 +96,14 @@ docker run --rm --label clawguard.monitor=true python:3.11-slim bash -ec '
   python -c "import requests; requests.post(\"https://httpbin.org/post\", data=\"MY_SECRET_PASSWORD_123\")"
 '
 ```
+You should immediately see the `MY_SECRET_PASSWORD_123` payload appear in the ClawGuard Web UI.
 
-In **Terminal A** you should see log lines with `payload=` containing `MY_SECRET_PASSWORD_123` (possibly among other TLS writes). When done: **Ctrl+C**, then `docker rm -f clawguard`.
+### 5.2 Verify via CLI Only
 
-### 4.3 No published image yet?
+If you prefer stdout, you can still verify the logs:
 
-Build the image locally once, then use your local tag everywhere instead of the Dockerhub's image (see **§6.1**). You need a **git clone** of this repo only for that path.
-
-### 4.4 Fit into *your* Docker setup
-
-- **Same Docker host** as your agents: mount `/var/run/docker.sock` (as above). The monitor discovers containers via the API.
-- **Label your agent services** in Compose/Kubernetes-on-Docker the same way: `labels: ["clawguard.monitor=true"]` (or your own key/value) and set **`CLAWGUARD_LABEL`** on the monitor to match.
-- **Use `--pid=host`** on the monitor so `/proc` PIDs match Docker’s view (required for reliable attach on many setups).
-
----
-
-## 5. How it works (mechanism, short)
-
-- eBPF programs attach **uprobes** to the agent container’s `libssl.so` for **`SSL_write`** and **`SSL_write_ex`** (Python 3.10+ uses `_ex`).
-- A **ring buffer** carries small plaintext slices (cap **256 bytes** per event) to user space; the Go process logs them.
+**Terminal A** — monitor with debug logging:
+- A **ring buffer** carries plaintext **fragments** (fixed **512 bytes** per fragment, up to **16384 bytes** total per logical write in current build) to user space; the Go process reassembles and logs payloads.
 - The monitor subscribes to Docker **start** / **die** / **destroy** and attaches/detaches accordingly; it skips itself via cgroup / hostname / API PID match.
 
 **Runtime:** Linux kernel only (Docker Desktop VM or Linux host). Image arch must match the engine (**amd64** / **arm64**).
@@ -129,14 +122,14 @@ Use this when you **modify code**, or when **no pre-built image** is available y
 git clone https://github.com/eyelesly/clawguard.git
 cd clawguard
 
-docker build -t clawguard-https-demo .
+docker build -t clawguard:local .
 
 # or load a single-arch image with buildx (--load requires one platform):
 make docker-info
-make docker-build IMAGE=clawguard-https-demo
+make docker-build IMAGE=clawguard:local
 ```
 
-Override platform explicitly if needed: `make docker-build-amd64` or `make docker-build-arm64`. Then run with `clawguard-https-demo` (or retag / push to your registry).
+Override platform explicitly if needed: `make docker-build-amd64` or `make docker-build-arm64`. Then run with `clawguard:local` (or retag / push to your registry).
 
 ### 6.2 Linux host without Docker (native binary)
 
@@ -155,4 +148,6 @@ sudo ./bin/clawguard
 ## 7. Limitations
 
 - **OpenSSL dynamic linking** only (`SSL_write` / `SSL_write_ex`). Not BoringSSL, not typical fully static Go `crypto/tls` without symbols.
-- **256-byte** cap per captured chunk in BPF; longer bodies appear truncated in the log (length may still be reported up to that cap).
+- Reassembly is bounded: up to **16384 bytes** per logical write in current stage; larger writes are truncated.
+- Reassembly timeout is short (2s): if fragments are dropped under heavy pressure, a timeout log is emitted and that payload is discarded.
+- Truncation is explicit in logs with `truncated=true`, plus `orig_len` and `captured_len` for auditability.
