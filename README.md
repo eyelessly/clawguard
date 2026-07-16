@@ -2,93 +2,102 @@
 
 ![ClawGuard](clawguard-logo.png)
 
-Monitor **TLS plaintext that your agents are about to send**—from outside the agent image—so you can audit secrets and policy before they hit the wire. This repo ships a **Docker-ready** eBPF collector (`clawguard`).
+**Cloud-native eBPF sidecar for AI agent observability** — capture TLS plaintext *before encryption* (OpenSSL `SSL_write` / `SSL_write_ex`) from outside the agent image. No MITM, no agent Dockerfile changes.
+
+Primary ops surface: **Prometheus metrics + Grafana**. Optional: **OpenTelemetry Logs** and a local **Debug Console**.
 
 ---
 
-## 1. What ClawGuard does
+## Quick Start (recommended): Kubernetes + Grafana
 
-### Why we call out specific AI agents (privacy risk)
+### 1. Deploy the DaemonSet
 
-[**OpenClaw**](https://openclaw.ai/), [**nanobot**](https://github.com/HKUDS/nanobot), and similar **autonomous AI agent** stacks are often run in containers with tool use, API keys, and access to user or environment context. In practice, that means **real risk of leaking personal information, prompts, or credentials** over **HTTPS**—whether through misconfiguration, overly broad tools, or unexpected model behavior. ClawGuard does not replace secure design or policy, but it gives **operators** a way to **see what plaintext is about to be written to TLS** (for workloads using dynamic **OpenSSL**), so you can **audit, alert, and respond** before data leaves your boundary.
+```bash
+kubectl apply -f deploy/kubernetes/rbac.yaml
+kubectl apply -f deploy/kubernetes/daemonset.yaml
+```
 
-- **Observes HTTPS writes at the OpenSSL layer** (`SSL_write` / `SSL_write_ex`) inside **Docker containers** you care about (typically **AI/agents** using `Python`, `node`, `curl`, etc. with dynamic `libssl`).
-- **Shows bytes before encryption**: useful to catch accidental **PII**, **API tokens**, or other sensitive payloads in outbound requests.
-- **Targets containers you select** via Docker **labels** (recommended) or, without a filter, any other container on the same Docker engine (use labels in production).
+ClawGuard watches Pods on each node with annotation:
 
-**What it is not:** a tool for monitoring a person’s normal desktop browsing. It is aimed at **operator-controlled agent workloads** you run in containers.
+```yaml
+metadata:
+  annotations:
+    clawguard.io/monitor: "true"
+```
 
----
+See [`deploy/kubernetes/example-monitored-pod.yaml`](deploy/kubernetes/example-monitored-pod.yaml).
 
-## 2. Why it is safe (for your security model)
+### 2. Scrape `/metrics`
 
-- **No TLS MITM in the network path**—traffic does not go through a decrypting proxy; the agent still speaks real TLS to the remote server.
-- **No extra CA or proxy config inside the agent image**—you are not weakening TLS trust for the workload.
-- **Scope is container- and label-based**: you attach visibility only to workloads you label (or explicitly allow), and the monitor skips its own container.
-- **Audit-friendly**: events go to **stdout**; you can ship logs to your existing stack.
+Each DaemonSet pod exposes Prometheus metrics on **`:8080/metrics`** (Service annotations included for common scrape setups).
 
-Running the monitor still requires **elevated privileges** on the Linux host/VM (`--privileged`, eBPF)—that is expected for kernel tracing; scope it to ops-managed machines.
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `clawguard_ssl_writes_total` | Counter | Reassembled SSL writes (`hook`, `truncated`) |
+| `clawguard_ssl_write_bytes_total` | Counter | Captured plaintext bytes |
+| `clawguard_reassembly_timeouts_total` | Counter | Dropped incomplete reassemblies |
+| `clawguard_attached_targets` | Gauge | Currently attached targets |
+| `clawguard_attach_errors_total` | Counter | Discover/attach failures |
 
----
+### 3. Import the official Grafana dashboard
 
-## 3. Why it is painless (non-intrusive)
+Import [`deploy/grafana/clawguard-dashboard.json`](deploy/grafana/clawguard-dashboard.json) into Grafana (Prometheus datasource). Panels cover write rate, bytes/sec, attached targets, timeouts, and attach errors.
 
-- **No change to agent source code or Dockerfiles** for the agent itself.
-- **No certificate injection** into the agent container.
-- **Kernel eBPF uprobes** on `libssl` in the agent’s filesystem view: the same buffers the app passes to OpenSSL are observed **before** encryption.
-- **Opt-in with labels**: add `--label` to agent containers and (optionally) `CLAWGUARD_LABEL` on the monitor—fits normal Docker Compose / orchestration habits.
+### 4. Optional: OpenTelemetry Logs
 
----
+Set on the DaemonSet:
 
-## 4. Web UI & Quick Start
+```yaml
+- name: OTEL_EXPORTER_OTLP_ENDPOINT
+  value: http://otel-collector:4318
+- name: OTEL_SERVICE_NAME
+  value: clawguard
+- name: OTEL_EXPORTER_OTLP_INSECURE
+  value: "1"
+```
 
-ClawGuard features a built-in **Wireshark-inspired Web UI** for real-time monitoring and historical audit.
-
-![ClawGuard UI](clawguard-ui.png)
-
-### 4.1 Features
-- **Real-time Streaming**: Capture and display TLS plaintext as it happens via WebSockets.
-- **Deep Inspection**: Metadata view including Container ID, PID, TID, and eBPF hook details.
-- **Hex Dump View**: Professional 16-column Hex + ASCII display for binary payloads.
-- **Dark Mode**: Fully optimized dark theme for low-light environments.
-- **Adjustable Layout**: Interactive splitters to resize the packet list, details, and hex view.
-- **Export**: One-click JSON export for further analysis.
-
-### 4.2 Run the Monitor with Web UI
-
-1. **Pull** the image:
-   ```bash
-   docker pull eyelessly/clawguard:latest
-   ```
-
-2. **Run** the monitor with port mapping (8080):
-   ```bash
-   docker rm -f clawguard 2>/dev/null
-   docker run -d --name clawguard \
-     --privileged --pid=host \
-     -p 8080:8080 \
-     -v /var/run/docker.sock:/var/run/docker.sock \
-     -e CLAWGUARD_LABEL=clawguard.monitor=true \
-     eyelessly/clawguard:latest
-   ```
-
-3. **IMPORTANT: Label your Agents!**
-   ClawGuard only captures traffic from containers that have the matching label. When starting your AI agent or any target container, you **must** add:
-   ```bash
-   docker run --label clawguard.monitor=true ...
-   ```
-
-4. **Access**: Open [http://localhost:8080](http://localhost:8080) in your browser.
+Each reassembled write becomes an OTLP **Log** (body = payload preview). If the HTTP plaintext contains a W3C `traceparent` header, ClawGuard attaches `trace_id` / `span_id` (best-effort user-space parse; eBPF-native Trace ID extraction is a later enhancement).
 
 ---
 
-## 5. Quick Verification
+## What ClawGuard does
 
-You can verify the system either through the **Web UI** or **CLI**.
+[**OpenClaw**](https://openclaw.ai/), [**nanobot**](https://github.com/HKUDS/nanobot), and similar agent stacks often run in containers with tools, API keys, and user context — and can leak PII or credentials over HTTPS. ClawGuard gives operators a **zero-intrusive** view of plaintext about to hit TLS.
 
-### 5.1 Verify with a Test Agent (UI)
+- Hooks **OpenSSL** inside selected containers/Pods (`SSL_write` / `SSL_write_ex`).
+- **No TLS MITM**, no extra CA, no agent source changes.
+- Selection: Docker **labels** or Kubernetes **annotations**.
+- Runtime: **Linux** only (host or Docker Desktop VM). Needs privileged eBPF.
 
-Once the monitor is running and you have opened the Web UI at `localhost:8080`, run this command to see live capture:
+---
+
+## Docker Compose / single-host
+
+```bash
+docker pull eyelessly/clawguard:latest
+docker rm -f clawguard 2>/dev/null
+docker run -d --name clawguard \
+  --privileged --pid=host \
+  -p 8080:8080 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e CLAWGUARD_LABEL=clawguard.monitor=true \
+  -e CLAWGUARD_DEBUG_UI=0 \
+  eyelessly/clawguard:latest
+```
+
+Label agents:
+
+```bash
+docker run --label clawguard.monitor=true ...
+```
+
+Verify metrics:
+
+```bash
+curl -s localhost:8080/metrics | grep clawguard_
+```
+
+Smoke test:
 
 ```bash
 docker run --rm --label clawguard.monitor=true python:3.11-slim bash -ec '
@@ -96,58 +105,56 @@ docker run --rm --label clawguard.monitor=true python:3.11-slim bash -ec '
   python -c "import requests; requests.post(\"https://httpbin.org/post\", data=\"MY_SECRET_PASSWORD_123\")"
 '
 ```
-You should immediately see the `MY_SECRET_PASSWORD_123` payload appear in the ClawGuard Web UI.
 
-### 5.2 Verify via CLI Only
+### Local Debug Console
 
-If you prefer stdout, you can still verify the logs:
+The built-in Wireshark-style UI is optional for single-machine debugging:
 
-**Terminal A** — monitor with debug logging:
-- A **ring buffer** carries plaintext **fragments** (fixed **512 bytes** per fragment, up to **16384 bytes** total per logical write in current build) to user space; the Go process reassembles and logs payloads.
-- The monitor subscribes to Docker **start** / **die** / **destroy** and attaches/detaches accordingly; it skips itself via cgroup / hostname / API PID match.
+- Default: UI + WebSocket on `:8080` (in addition to `/metrics`).
+- Production / K8s: set `CLAWGUARD_DEBUG_UI=0` to serve only `/metrics`.
 
-**Runtime:** Linux kernel only (Docker Desktop VM or Linux host). Image arch must match the engine (**amd64** / **arm64**).
+![ClawGuard UI](clawguard-ui.png)
 
 ---
 
-## 6. Advanced: build from source (developers)
+## Configuration
 
-Use this when you **modify code**, or when **no pre-built image** is available yet. End users should prefer **`docker pull`** (§4).
+| Env | Default | Description |
+|-----|---------|-------------|
+| `CLAWGUARD_LABEL` | _(none)_ | Docker mode: `key=value` pairs (AND). Example: `clawguard.monitor=true` |
+| `CLAWGUARD_POD_ANNOTATION` | `clawguard.io/monitor=true` | K8s mode: single `key=value` annotation filter |
+| `NODE_NAME` | _(required in K8s)_ | Downward API node name |
+| `CLAWGUARD_DEBUG_UI` | on | Set `0` / `false` / `off` to disable UI/WS |
+| `CLAWGUARD_DEBUG` | _(off)_ | Verbose attach/reassembly logs |
+| `CLAWGUARD_PAYLOAD_PREVIEW_MAX` | `16384` | Log/OTel body preview cap |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | _(empty = off)_ | Enable OTLP HTTP log export |
+| `OTEL_SERVICE_NAME` | `clawguard` | OTel resource service name |
+| `OTEL_EXPORTER_OTLP_INSECURE` | _(off)_ | Allow plain HTTP to collector |
+| `DOCKER_HOST` | `unix:///var/run/docker.sock` | Docker engine endpoint |
 
-### 6.1 Docker image (macOS / Windows / Linux)
+Mode selection: if `KUBERNETES_SERVICE_HOST` is set → **Kubernetes**; otherwise → **Docker**.
 
-**You do not run `make build` on the host before this.** The `Dockerfile` already runs `make generate` and compiles the Go binary **inside** the build stage, so `docker build` (or `make docker-build` below) is enough.
+---
+
+## Build from source
 
 ```bash
-git clone https://github.com/eyelesly/clawguard.git
-cd clawguard
-
 docker build -t clawguard:local .
-
-# or load a single-arch image with buildx (--load requires one platform):
-make docker-info
+# or
 make docker-build IMAGE=clawguard:local
 ```
 
-Override platform explicitly if needed: `make docker-build-amd64` or `make docker-build-arm64`. Then run with `clawguard:local` (or retag / push to your registry).
-
-### 6.2 Linux host without Docker (native binary)
-
-**Separate from §6.1** — for running `./bin/clawguard` on bare Linux, not for building the container image.
-
-Requires `clang`, `llvm`, `libbpf-dev`, Go **1.22+**. The Makefile sets **BPF arch from `uname -m`** (`x86_64` / `aarch64` / `arm64`).
+Native Linux (requires `clang`, `llvm`, `libbpf-dev`, Go 1.22+):
 
 ```bash
-# Linux Only
 make build
 sudo ./bin/clawguard
 ```
 
 ---
 
-## 7. Limitations
+## Limitations
 
-- **OpenSSL dynamic linking** only (`SSL_write` / `SSL_write_ex`). Not BoringSSL, not typical fully static Go `crypto/tls` without symbols.
-- Reassembly is bounded: up to **16384 bytes** per logical write in current stage; larger writes are truncated.
-- Reassembly timeout is short (2s): if fragments are dropped under heavy pressure, a timeout log is emitted and that payload is discarded.
-- Truncation is explicit in logs with `truncated=true`, plus `orig_len` and `captured_len` for auditability.
+- **OpenSSL dynamic linking** (plus Node static-OpenSSL executable fallback). Not BoringSSL / typical static Go `crypto/tls`.
+- Capture capped at **16384 bytes** per logical write; reassembly TTL **2s**.
+- Trace correlation via plaintext `traceparent` only (no eBPF Trace ID extraction yet).

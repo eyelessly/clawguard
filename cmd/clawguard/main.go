@@ -179,16 +179,25 @@ type labelPair struct {
 type containerWatch struct {
 	mu              sync.Mutex
 	byID            map[string]*attachSet
+	metaByID        map[string]targetMeta
 	objs            *ssl_writeObjects
 	ringReader      *ringbuf.Reader
 	selfContainerID string      // 12- or 64-hex; skip attaching to ourselves (cgroup, hostname, or Docker API pid match)
 	labelPairs      []labelPair // empty = monitor all non-self; non-empty = AND match on container labels
 	hub             *hub
+	otel            *otelEmitter
 }
 
 type attachSet struct {
 	links       []link.Link
 	containerID string
+}
+
+type targetMeta struct {
+	podName       string
+	podNamespace  string
+	runtime       string
+	containerName string
 }
 
 func main() {
@@ -205,19 +214,13 @@ func main() {
 	log.Printf("CLAWGUARD_PAYLOAD_PREVIEW_MAX=%d (display-only cap)", logPayloadMaxBytes)
 	logRuntimeContext()
 
-	dockerSock := "unix:///var/run/docker.sock"
-	if v := os.Getenv("DOCKER_HOST"); v != "" {
-		dockerSock = v
-	}
-
-	cli, err := client.NewClientWithOpts(
-		client.WithHost(dockerSock),
-		client.WithAPIVersionNegotiation(),
-	)
+	otelOut, err := initOTel(ctx)
 	if err != nil {
-		log.Fatalf("docker client: %v", err)
+		log.Fatalf("otel: %v", err)
 	}
-	defer cli.Close()
+	if otelOut != nil {
+		defer otelOut.shutdown(context.Background())
+	}
 
 	objs := &ssl_writeObjects{}
 	log.Println("loading BPF collection (ssl_write + ssl_write_ex)...")
@@ -233,10 +236,56 @@ func main() {
 	}
 	defer rd.Close()
 
+	cw := &containerWatch{
+		byID:       make(map[string]*attachSet),
+		metaByID:   make(map[string]targetMeta),
+		objs:       objs,
+		ringReader: rd,
+		hub:        newHub(),
+		otel:       otelOut,
+	}
+
+	go cw.hub.run(ctx)
+	go startHTTPServer(ctx, cw.hub, 8080)
+	go cw.readLoop(ctx)
+
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		selfID := detectSelfContainerID()
+		cw.selfContainerID = selfID
+		if selfID != "" {
+			log.Printf("self container id (skip attach): %s", shortID(selfID))
+		}
+		log.Println("ClawGuard: Kubernetes mode (pod annotation select + SSL_write/SSL_write_ex)")
+		if err := cw.runK8sMode(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Fatalf("k8s mode: %v", err)
+		}
+		cw.detachAll()
+		return
+	}
+
+	cw.runDockerMode(ctx)
+}
+
+func (cw *containerWatch) runDockerMode(ctx context.Context) {
+	dockerSock := "unix:///var/run/docker.sock"
+	if v := os.Getenv("DOCKER_HOST"); v != "" {
+		dockerSock = v
+	}
+
+	cli, err := client.NewClientWithOpts(
+		client.WithHost(dockerSock),
+		client.WithAPIVersionNegotiation(),
+	)
+	if err != nil {
+		log.Fatalf("docker client: %v", err)
+	}
+	defer cli.Close()
+
 	selfID := detectSelfContainerID()
 	if selfID == "" {
 		selfID = detectSelfViaDockerAPI(ctx, cli)
 	}
+	cw.selfContainerID = selfID
 	if selfID != "" {
 		log.Printf("self container id (skip attach): %s", shortID(selfID))
 	} else {
@@ -247,24 +296,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("CLAWGUARD_LABEL: %v", err)
 	}
+	cw.labelPairs = labelPairs
 	if len(labelPairs) > 0 {
 		log.Printf("monitor filter (all must match): %s", formatLabelFilterLog(labelPairs))
 	} else {
 		log.Println("monitor filter: (none) all non-self containers with libssl")
 	}
-
-	cw := &containerWatch{
-		byID:            make(map[string]*attachSet),
-		objs:            objs,
-		ringReader:      rd,
-		selfContainerID: selfID,
-		labelPairs:      labelPairs,
-		hub:             newHub(),
-	}
-
-	go cw.hub.run(ctx)
-	go startHTTPServer(ctx, cw.hub, 8080)
-	go cw.readLoop(ctx)
 
 	if err := cw.scanRunning(ctx, cli); err != nil {
 		log.Printf("initial scan: %v", err)
@@ -276,7 +313,6 @@ func main() {
 	}
 
 	evCh, errCh := cli.Events(ctx, types.EventsOptions{})
-
 	log.Println("ClawGuard: listening for Docker events + SSL_write/SSL_write_ex")
 
 	for {
@@ -506,20 +542,27 @@ func (cw *containerWatch) readLoop(ctx context.Context) {
 				ev.PID, ev.TID, ev.CallID, len(out), st.origLen, st.totalLen, st.truncated, st.fragCnt, formatPayloadForLog(out),
 			)
 
-			// Broadcast to Web UI
-			containerID := cw.findContainerIDByPID(ev.PID)
-			broadcastPacket(cw.hub, PacketEvent{
-				Timestamp:   time.Now(),
-				PID:         ev.PID,
-				TID:         ev.TID,
-				CallID:      ev.CallID,
-				OrigLen:     st.origLen,
-				CapturedLen: st.totalLen,
-				Truncated:   st.truncated,
-				HookType:    ev.HookType,
-				Payload:     sanitizeUTF8(out),
-				ContainerID: containerID,
-			})
+			recordSSLWrite(ev.HookType, st.truncated, len(out))
+
+			containerID, meta := cw.lookupTargetByPID(ev.PID)
+			pkt := PacketEvent{
+				Timestamp:    time.Now(),
+				PID:          ev.PID,
+				TID:          ev.TID,
+				CallID:       ev.CallID,
+				OrigLen:      st.origLen,
+				CapturedLen:  st.totalLen,
+				Truncated:    st.truncated,
+				HookType:     ev.HookType,
+				Payload:      sanitizeUTF8(out),
+				ContainerID:  containerID,
+				PodName:      meta.podName,
+				PodNamespace: meta.podNamespace,
+			}
+			broadcastPacket(cw.hub, pkt)
+			if cw.otel != nil {
+				cw.otel.emitSSLWrite(pkt, formatPayloadForLog(out))
+			}
 
 			delete(reassemblies, key)
 		}
@@ -534,6 +577,7 @@ func (cw *containerWatch) readLoop(ctx context.Context) {
 				continue
 			}
 			log.Printf("reassembly timeout pid=%d tid=%d call=%d have=%d/%d first_seen_ms=%d", k.PID, k.TID, k.CallID, len(v.frags), v.fragCnt, now.Sub(v.firstAt).Milliseconds())
+			recordReassemblyTimeout()
 			delete(reassemblies, k)
 		}
 		lastCleanup = now
@@ -644,21 +688,24 @@ func (cw *containerWatch) attachContainer(ctx context.Context, cli *client.Clien
 	rootPID, err := waitContainerPID(ctx, cli, containerID)
 	if err != nil {
 		log.Printf("container %s: wait pid: %v", shortID(containerID), err)
+		recordAttachError()
 		return
 	}
 	debugLog("attachContainer id=%s root pid=%d", shortID(containerID), rootPID)
+	cw.attachUprobes(ctx, containerID, rootPID, targetMeta{})
+}
 
+// attachUprobes discovers libssl (or node fallback) under /proc/<pid>/root and attaches uprobes.
+func (cw *containerWatch) attachUprobes(ctx context.Context, containerID string, rootPID int, meta targetMeta) {
 	cw.mu.Lock()
 	if _, ok := cw.byID[containerID]; ok {
+		cw.metaByID[containerID] = meta
 		cw.mu.Unlock()
-		debugLog("attachContainer id=%s already attached, skip", shortID(containerID))
+		debugLog("attachUprobes id=%s already attached, skip", shortID(containerID))
 		return
 	}
 	cw.mu.Unlock()
 
-	// Resolve libssl on disk under the container root. Do not rely on enumerating PIDs in the same
-	// namespace as Docker PID1: on some setups (e.g. Docker Desktop) that list only shows the
-	// shim PID, and short-lived python children are easy to miss between polls.
 	var lib string
 	var discoverErr error
 	const maxAttempts = 20
@@ -677,71 +724,72 @@ func (cw *containerWatch) attachContainer(ctx context.Context, cli *client.Clien
 		time.Sleep(delay)
 	}
 	if lib == "" || discoverErr != nil {
-		// Some runtimes (notably certain Node builds) may statically link OpenSSL,
-		// so there is no standalone libssl.so in the container filesystem.
-		// Fallback: try attaching directly to the node executable if present.
 		if nodeExe, nodeErr := discoverNodeExecutableUnderProcRoot(rootPID); nodeErr == nil && nodeExe != "" {
 			exe, err := link.OpenExecutable(nodeExe)
 			if err != nil {
 				log.Printf("container %s: open node executable %s: %v", shortID(containerID), nodeExe, err)
+				recordAttachError()
 				return
 			}
 			lw, err := exe.Uprobe("SSL_write", cw.objs.ProbeSslWrite, nil)
 			if err != nil {
 				log.Printf("container %s: uprobe SSL_write on node %s: %v", shortID(containerID), nodeExe, err)
+				recordAttachError()
 				return
 			}
 			lex, err := exe.Uprobe("SSL_write_ex", cw.objs.ProbeSslWriteEx, nil)
 			if err != nil {
 				_ = lw.Close()
 				log.Printf("container %s: uprobe SSL_write_ex on node %s: %v", shortID(containerID), nodeExe, err)
+				recordAttachError()
 				return
 			}
 			log.Printf("attached SSL_write + SSL_write_ex uprobes on node executable: container=%s exe=%s", shortID(containerID), nodeExe)
-
-			cw.mu.Lock()
-			defer cw.mu.Unlock()
-			if _, ok := cw.byID[containerID]; ok {
-				_ = lw.Close()
-				_ = lex.Close()
-				return
-			}
-			cw.byID[containerID] = &attachSet{links: []link.Link{lw, lex}, containerID: containerID}
+			cw.registerAttach(containerID, meta, lw, lex)
 			return
 		}
 
 		log.Printf("container %s: no libssl.so under /proc/%d/root (and no node executable fallback): %v", shortID(containerID), rootPID, discoverErr)
+		recordAttachError()
 		return
 	}
 
 	exe, err := link.OpenExecutable(lib)
 	if err != nil {
 		log.Printf("container %s: open %s: %v", shortID(containerID), lib, err)
+		recordAttachError()
 		return
 	}
 
-	// nil opts => UprobeOptions.PID == 0 => any process using this DSO (CPython 3.10+ uses SSL_write_ex).
 	lw, err := exe.Uprobe("SSL_write", cw.objs.ProbeSslWrite, nil)
 	if err != nil {
 		log.Printf("container %s: uprobe SSL_write on %s: %v", shortID(containerID), lib, err)
+		recordAttachError()
 		return
 	}
 	lex, err := exe.Uprobe("SSL_write_ex", cw.objs.ProbeSslWriteEx, nil)
 	if err != nil {
 		_ = lw.Close()
 		log.Printf("container %s: uprobe SSL_write_ex on %s: %v", shortID(containerID), lib, err)
+		recordAttachError()
 		return
 	}
 	log.Printf("attached SSL_write + SSL_write_ex uprobes (all PIDs using this lib): container=%s lib=%s", shortID(containerID), lib)
+	cw.registerAttach(containerID, meta, lw, lex)
+}
 
+func (cw *containerWatch) registerAttach(containerID string, meta targetMeta, links ...link.Link) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
 	if _, ok := cw.byID[containerID]; ok {
-		_ = lw.Close()
-		_ = lex.Close()
+		for _, l := range links {
+			_ = l.Close()
+		}
 		return
 	}
-	cw.byID[containerID] = &attachSet{links: []link.Link{lw, lex}, containerID: containerID}
+	cw.byID[containerID] = &attachSet{links: links, containerID: containerID}
+	cw.metaByID[containerID] = meta
+	setAttachedTargets(len(cw.byID))
 }
 
 // discoverLibSSLUnderProcRoot finds libssl.so* inside the container filesystem via /proc/<pid>/root.
@@ -835,13 +883,27 @@ func discoverNodeExecutableUnderProcRoot(rootPID int) (string, error) {
 
 func (cw *containerWatch) detachContainer(containerID string) {
 	cw.mu.Lock()
-	as := cw.byID[containerID]
-	delete(cw.byID, containerID)
+	var toClose []link.Link
+	var removed []string
+	for id, as := range cw.byID {
+		if id == containerID || containerIDsMatch(id, containerID) {
+			if as != nil {
+				toClose = append(toClose, as.links...)
+			}
+			removed = append(removed, id)
+		}
+	}
+	for _, id := range removed {
+		delete(cw.byID, id)
+		delete(cw.metaByID, id)
+	}
+	n := len(cw.byID)
 	cw.mu.Unlock()
-	if as == nil {
+	setAttachedTargets(n)
+	if len(toClose) == 0 {
 		return
 	}
-	for _, l := range as.links {
+	for _, l := range toClose {
 		_ = l.Close()
 	}
 	log.Printf("detached uprobes: container=%s", shortID(containerID))
@@ -888,17 +950,39 @@ func waitContainerPID(ctx context.Context, cli *client.Client, containerID strin
 	return 0, fmt.Errorf("no pid after retries")
 }
 
-func (cw *containerWatch) findContainerIDByPID(pid uint32) string {
+func (cw *containerWatch) lookupTargetByPID(pid uint32) (containerID string, meta targetMeta) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
-	// This is a heuristic: we don't have a direct PID -> ContainerID map that's always up to date
-	// because we attach to the DSO, not individual PIDs.
-	// For now, we return the first attached container ID as a placeholder or "unknown"
-	// In a more robust implementation, we'd use /proc/pid/cgroup to resolve this.
-	for id := range cw.byID {
-		return id
+
+	if cg, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid)); err == nil {
+		s := strings.ToLower(string(cg))
+		for id, m := range cw.metaByID {
+			needle := strings.ToLower(id)
+			if len(needle) > 12 {
+				needle = needle[:12]
+			}
+			if strings.Contains(s, strings.ToLower(id)) || (len(needle) >= 12 && strings.Contains(s, needle)) {
+				return id, m
+			}
+		}
+		for id := range cw.byID {
+			needle := strings.ToLower(id)
+			if len(needle) > 12 {
+				needle = needle[:12]
+			}
+			if strings.Contains(s, strings.ToLower(id)) || (len(needle) >= 12 && strings.Contains(s, needle)) {
+				return id, cw.metaByID[id]
+			}
+		}
 	}
-	return "unknown"
+
+	for id, m := range cw.metaByID {
+		return id, m
+	}
+	for id := range cw.byID {
+		return id, targetMeta{}
+	}
+	return "unknown", targetMeta{}
 }
 
 func shortID(id string) string {

@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: clawguard
+  namespace: clawguard
+  labels:
+    app.kubernetes.io/name: clawguard
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: clawguard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: clawguard
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: clawguard
+      hostPID: true
+      containers:
+        - name: clawguard
+          image: eyelessly/clawguard:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CLAWGUARD_POD_ANNOTATION
+              value: clawguard.io/monitor=true
+            - name: CLAWGUARD_DEBUG_UI
+              value: "0"
+            # Optional: set to enable OTLP log export
+            # - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            #   value: http://otel-collector.observability:4318
+            # - name: OTEL_SERVICE_NAME
+            #   value: clawguard
+            # - name: OTEL_EXPORTER_OTLP_INSECURE
+            #   value: "1"
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: sys
+          hostPath:
+            path: /sys
+      tolerations:
+        - operator: Exists
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clawguard
+  namespace: clawguard
+  labels:
+    app.kubernetes.io/name: clawguard
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+spec:
+  selector:
+    app.kubernetes.io/name: clawguard
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
