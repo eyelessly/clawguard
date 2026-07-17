@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-// uprobe on OpenSSL SSL_write — plaintext before encryption.
+// uprobe on OpenSSL SSL_write - plaintext before encryption (streaming, no default size cap).
 
 #include <linux/bpf.h>
 #include <linux/types.h>
 
-/* libbpf headers only forward-declare these under -target bpf; complete layouts (UAPI). */
 #if defined(__TARGET_ARCH_arm64)
 struct user_pt_regs {
 	__u64 regs[31];
@@ -42,12 +41,13 @@ struct pt_regs {
 #include <bpf/bpf_tracing.h>
 
 #define CHUNK_SIZE 512
-#define MAX_CAPTURE_BYTES 16384
-#define MAX_FRAGMENTS (MAX_CAPTURE_BYTES / CHUNK_SIZE)
+/* Kernel bpf_loop hard limit is 1<<23; keep headroom for ringbuf pressure. */
+#define BPF_LOOP_MAX (1u << 20)
 #define DEDUP_WINDOW_NS 2000000ULL
 
 #define HOOK_SSL_WRITE 1
 #define HOOK_SSL_WRITE_EX 2
+#define HOOK_GO_TLS_WRITE 3
 
 struct ssl_event {
 	__u32 pid;
@@ -71,9 +71,17 @@ struct call_state {
 	__u32 seq;
 };
 
+/* config[0] = optional max capture bytes; 0 = unlimited (default). */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} config_map SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 1 << 24);
+	__uint(max_entries, 1 << 25);
 } events SEC(".maps");
 
 struct {
@@ -83,14 +91,19 @@ struct {
 	__type(value, struct call_state);
 } call_states SEC(".maps");
 
+struct emit_ctx {
+	const char *buf;
+	__u64 pid_tgid;
+	__u32 call_id;
+	__u32 orig_len;
+	__u32 total_len;
+	__u32 truncated;
+	__u32 frag_cnt;
+	__u32 hook_type;
+};
+
 char LICENSE[] SEC("license") = "Dual MIT/GPL";
 
-/*
- * SSL_write(SSL *ssl, const void *buf, int num)
- * SSL_write_ex(SSL *ssl, const void *buf, size_t num, size_t *written)
- * First three arguments match (buf = PARM2, len = PARM3 on x86_64 and arm64).
- * CPython 3.10+ uses SSL_write_ex only — hook both or Python HTTPS shows no events.
- */
 static __always_inline __u32 next_call_id(__u64 pid_tgid, __u64 buf, __u32 num, __u64 now_ns)
 {
 	struct call_state *st;
@@ -125,91 +138,143 @@ static __always_inline __u32 next_call_id(__u64 pid_tgid, __u64 buf, __u32 num, 
 	return call_id;
 }
 
-static __always_inline int emit_ssl_plaintext(struct pt_regs *ctx, __u32 hook_type)
+static __always_inline __u32 optional_max_capture(void)
 {
-	void *buf;
-	long num_long;
-	int num;
+	__u32 key = 0;
+	__u32 *v = bpf_map_lookup_elem(&config_map, &key);
+	if (!v)
+		return 0;
+	return *v;
+}
+
+static long emit_one_frag(__u32 index, void *data)
+{
+	struct emit_ctx *c = data;
+	struct ssl_event *e;
+	__u32 offset;
+	__u32 chunk_len;
+
+	if (index >= c->frag_cnt)
+		return 1;
+
+	offset = index * CHUNK_SIZE;
+	chunk_len = c->total_len - offset;
+	if (chunk_len > CHUNK_SIZE)
+		chunk_len = CHUNK_SIZE;
+
+	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e) {
+		c->truncated = 1;
+		return 1;
+	}
+
+	e->pid = c->pid_tgid >> 32;
+	e->tid = (__u32)c->pid_tgid;
+	e->call_id = c->call_id;
+	e->orig_len = c->orig_len;
+	e->total_len = c->total_len;
+	e->truncated = c->truncated;
+	e->frag_idx = index;
+	e->frag_cnt = c->frag_cnt;
+	e->chunk_len = chunk_len;
+	e->hook_type = c->hook_type;
+
+	if (bpf_probe_read_user(e->payload, CHUNK_SIZE, (void *)(c->buf + offset))) {
+		e->chunk_len = 0;
+	}
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+static __always_inline int emit_from_buf(const void *buf, long num_long, __u32 hook_type)
+{
 	__u32 total_len;
 	__u32 orig_len;
 	__u32 truncated;
 	__u32 frag_cnt;
 	__u32 call_id;
+	__u32 max_cap;
 	__u64 pid_tgid;
 	__u64 now_ns;
-	__u32 i;
+	__u64 frag64;
+	struct emit_ctx ec = {};
+	int num;
 
-	buf = (void *)PT_REGS_PARM2(ctx);
-	num_long = (long)PT_REGS_PARM3(ctx);
-	if (num_long < 0 || num_long > 0x7fffffff) {
+	if (num_long < 0 || num_long > 0x7fffffff)
 		return 0;
-	}
 	num = (int)num_long;
-
-	if (num <= 0 || !buf) {
+	if (num <= 0 || !buf)
 		return 0;
-	}
 
 	orig_len = (__u32)num;
 	total_len = orig_len;
 	truncated = 0;
-	if (total_len > MAX_CAPTURE_BYTES)
-	{
-		total_len = MAX_CAPTURE_BYTES;
+
+	max_cap = optional_max_capture();
+	if (max_cap > 0 && total_len > max_cap) {
+		total_len = max_cap;
 		truncated = 1;
 	}
 
-	frag_cnt = (total_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
-	if (frag_cnt == 0)
+	frag64 = ((__u64)total_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+	if (frag64 == 0)
 		return 0;
-	if (frag_cnt > MAX_FRAGMENTS)
-		frag_cnt = MAX_FRAGMENTS;
+	if (frag64 > BPF_LOOP_MAX) {
+		frag_cnt = BPF_LOOP_MAX;
+		total_len = BPF_LOOP_MAX * CHUNK_SIZE;
+		truncated = 1;
+	} else {
+		frag_cnt = (__u32)frag64;
+	}
 
 	pid_tgid = bpf_get_current_pid_tgid();
 	now_ns = bpf_ktime_get_ns();
 	call_id = next_call_id(pid_tgid, (__u64)buf, (__u32)num, now_ns);
 
-	/*
-	 * Strict verifiers (e.g. Linux 6.12 linuxkit): only a constant or
-	 * "var & const" satisfies R2; range-split alone is not enough.
-	 * Always use constant read size — matches verifier hint for bpf_probe_read_user.
-	 * For fragment events we still keep CHUNK_SIZE constant and truncate chunk_len.
-	 */
-	#pragma unroll
-	for (i = 0; i < MAX_FRAGMENTS; i++) {
-		struct ssl_event *e;
-		__u32 offset;
-		__u32 chunk_len;
+	ec.buf = (const char *)buf;
+	ec.pid_tgid = pid_tgid;
+	ec.call_id = call_id;
+	ec.orig_len = orig_len;
+	ec.total_len = total_len;
+	ec.truncated = truncated;
+	ec.frag_cnt = frag_cnt;
+	ec.hook_type = hook_type;
 
-		if (i >= frag_cnt)
-			break;
-
-		offset = i * CHUNK_SIZE;
-		chunk_len = total_len - offset;
-		if (chunk_len > CHUNK_SIZE)
-			chunk_len = CHUNK_SIZE;
-
-		e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-		if (!e)
-			break;
-
-		e->pid = pid_tgid >> 32;
-		e->tid = (__u32)pid_tgid;
-		e->call_id = call_id;
-		e->orig_len = orig_len;
-		e->total_len = total_len;
-		e->truncated = truncated;
-		e->frag_idx = i;
-		e->frag_cnt = frag_cnt;
-		e->chunk_len = chunk_len;
-		e->hook_type = hook_type;
-
-		if (bpf_probe_read_user(e->payload, CHUNK_SIZE, (void *)((char *)buf + offset))) {
-			e->chunk_len = 0;
-		}
-		bpf_ringbuf_submit(e, 0);
-	}
+	bpf_loop(frag_cnt, emit_one_frag, &ec, 0);
 	return 0;
+}
+
+static __always_inline int emit_ssl_plaintext(struct pt_regs *ctx, __u32 hook_type)
+{
+	void *buf = (void *)PT_REGS_PARM2(ctx);
+	long num_long = (long)PT_REGS_PARM3(ctx);
+	return emit_from_buf(buf, num_long, hook_type);
+}
+
+/*
+ * Go register ABI (1.17+): method (c *Conn).Write(b []byte)
+ * amd64: AX=recv, BX=ptr, CX=len, DI=cap
+ * arm64: R0=recv, R1=ptr, R2=len, R3=cap
+ */
+SEC("uprobe")
+int probe_go_tls_write(struct pt_regs *ctx)
+{
+	void *buf;
+	long num;
+
+#if defined(__TARGET_ARCH_x86)
+	buf = (void *)ctx->rbx;
+	num = (long)ctx->rcx;
+#elif defined(__TARGET_ARCH_arm64)
+	{
+		struct user_pt_regs *uregs = (struct user_pt_regs *)ctx;
+		buf = (void *)uregs->regs[1];
+		num = (long)uregs->regs[2];
+	}
+#else
+	return 0;
+#endif
+	return emit_from_buf(buf, num, HOOK_GO_TLS_WRITE);
 }
 
 SEC("uprobe")

@@ -83,7 +83,7 @@ docker run -d --name "$NAME" \
   -e CLAWGUARD_DEBUG=1 \
   "$IMAGE" >/dev/null
 
-log "waiting for /metrics"
+log "waiting for /metrics + version banner + file plugin"
 deadline=$((SECONDS + TIMEOUT_SEC))
 until curl -sf "http://127.0.0.1:${PORT}/metrics" | grep -q 'clawguard_'; do
   (( SECONDS < deadline )) || {
@@ -92,6 +92,22 @@ until curl -sf "http://127.0.0.1:${PORT}/metrics" | grep -q 'clawguard_'; do
   }
   sleep 1
 done
+
+ok_ver=0
+ok_plug=0
+while (( SECONDS < deadline )); do
+  logs="$(docker logs "$NAME" 2>&1 || true)"
+  if printf '%s\n' "$logs" | grep -q 'version='; then ok_ver=1; fi
+  if printf '%s\n' "$logs" | grep -q 'plugin loaded name=file'; then ok_plug=1; fi
+  if (( ok_ver == 1 && ok_plug == 1 )); then
+    break
+  fi
+  sleep 1
+done
+if (( ok_ver != 1 || ok_plug != 1 )); then
+  docker logs "$NAME" 2>&1 | tail -50 >&2 || true
+  die "startup checks failed version_ok=$ok_ver plugin_ok=$ok_plug"
+fi
 
 before="$(curl -sf "http://127.0.0.1:${PORT}/metrics" | awk '/^clawguard_ssl_writes_total/{s+=$2} END{print s+0}')"
 
@@ -111,10 +127,11 @@ requests.post(
 \"
 "
 
-log "waiting for ssl_writes increase + marker in logs"
+log "waiting for ssl_writes increase + marker in logs/file"
 deadline=$((SECONDS + TIMEOUT_SEC))
 found_metric=0
 found_log=0
+found_file=0
 after="$before"
 while (( SECONDS < deadline )); do
   after="$(curl -sf "http://127.0.0.1:${PORT}/metrics" | awk '/^clawguard_ssl_writes_total/{s+=$2} END{print s+0}')"
@@ -125,12 +142,16 @@ while (( SECONDS < deadline )); do
   if docker logs "$NAME" 2>&1 | grep -qF "$MARKER"; then
     found_log=1
   fi
-  if (( found_metric == 1 && found_log == 1 )); then
-    log "PASS metrics ssl_writes ${before}→${after} attached=${attached:-?} marker in logs"
+  if docker exec "$NAME" sh -c "test -f /var/log/clawguard/plaintext.jsonl && grep -qF '$MARKER' /var/log/clawguard/plaintext.jsonl && grep -q clawguard_version /var/log/clawguard/plaintext.jsonl && grep -q '\"name\":\"file\"' /var/log/clawguard/plaintext.jsonl"; then
+    found_file=1
+  fi
+  if (( found_metric == 1 && found_log == 1 && found_file == 1 )); then
+    log "PASS metrics ssl_writes ${before}→${after} attached=${attached:-?} marker in logs+file (versioned)"
     exit 0
   fi
   sleep 1
 done
 
 docker logs "$NAME" 2>&1 | tail -100 >&2 || true
-die "timeout: metric_ok=$found_metric log_ok=$found_log (before=$before after=$after)"
+docker exec "$NAME" sh -c 'tail -5 /var/log/clawguard/plaintext.jsonl 2>/dev/null' >&2 || true
+die "timeout: metric_ok=$found_metric log_ok=$found_log file_ok=$found_file (before=$before after=$after)"

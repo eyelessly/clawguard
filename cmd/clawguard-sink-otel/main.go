@@ -9,6 +9,11 @@ import (
 	"strings"
 	"time"
 
+	pluginv1 "clawguard/api/plugin/v1"
+	"clawguard/internal/event"
+	"clawguard/internal/version"
+	"clawguard/pkg/pluginsdk"
+
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	otellog "go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
@@ -19,66 +24,80 @@ import (
 
 var traceparentRe = regexp.MustCompile(`(?i)(?:^|\r?\n)traceparent:\s*([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})`)
 
-type otelEmitter struct {
-	logger   otellog.Logger
-	provider *sdklog.LoggerProvider
+func main() {
+	pluginsdk.MaybeVersionFlag("clawguard-sink-otel")
+	pluginsdk.Serve(&otelSink{})
 }
 
-func initOTel(ctx context.Context) (*otelEmitter, error) {
-	endpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
-	if endpoint == "" {
-		return nil, nil
-	}
+type otelSink struct {
+	pluginsdk.SinkOnly
+	logger   otellog.Logger
+	provider *sdklog.LoggerProvider
+	preview  int
+}
 
-	serviceName := strings.TrimSpace(os.Getenv("OTEL_SERVICE_NAME"))
+func (s *otelSink) Info() pluginv1.PluginInfo {
+	return pluginsdk.FillInfo("otel", "sink")
+}
+
+func (s *otelSink) Configure(cfg pluginv1.PluginConfig) error {
+	endpoint, _ := cfg.Settings["endpoint"].(string)
+	if endpoint == "" {
+		endpoint = strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	}
+	if endpoint == "" {
+		return nil // no-op sink
+	}
+	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" {
+		_ = os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
+	}
+	serviceName, _ := cfg.Settings["service_name"].(string)
+	if serviceName == "" {
+		serviceName = os.Getenv("OTEL_SERVICE_NAME")
+	}
 	if serviceName == "" {
 		serviceName = "clawguard"
 	}
+	s.preview = 16384
 
 	opts := []otlploghttp.Option{}
-	if strings.HasPrefix(endpoint, "http://") || os.Getenv("OTEL_EXPORTER_OTLP_INSECURE") == "1" {
+	insecure, _ := cfg.Settings["insecure"].(bool)
+	if insecure || strings.HasPrefix(endpoint, "http://") || os.Getenv("OTEL_EXPORTER_OTLP_INSECURE") == "1" {
 		opts = append(opts, otlploghttp.WithInsecure())
 	}
-
-	exporter, err := otlploghttp.New(ctx, opts...)
+	exporter, err := otlploghttp.New(context.Background(), opts...)
 	if err != nil {
-		return nil, err
+		return err
 	}
-
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceName(serviceName),
+			semconv.ServiceVersion(version.Version),
 		),
 	)
 	if err != nil {
-		return nil, err
+		return err
 	}
-
 	provider := sdklog.NewLoggerProvider(
 		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter)),
 		sdklog.WithResource(res),
 	)
-	logger := provider.Logger("clawguard.ssl_write")
-	log.Printf("OTel logs enabled → %s (service=%s)", endpoint, serviceName)
-	return &otelEmitter{logger: logger, provider: provider}, nil
+	s.provider = provider
+	s.logger = provider.Logger("clawguard.ssl_write")
+	log.Printf("otel sink → %s service=%s", endpoint, serviceName)
+	return nil
 }
 
-func (e *otelEmitter) shutdown(ctx context.Context) {
-	if e == nil || e.provider == nil {
-		return
+func (s *otelSink) Emit(ev *event.CaptureEvent) error {
+	if s.logger == nil {
+		return nil
 	}
-	if err := e.provider.Shutdown(ctx); err != nil {
-		log.Printf("otel shutdown: %v", err)
+	body := string(ev.Payload)
+	if len(body) > s.preview {
+		body = body[:s.preview] + "…"
 	}
-}
-
-func (e *otelEmitter) emitSSLWrite(ev PacketEvent, payloadPreview string) {
-	if e == nil {
-		return
-	}
-
 	attrs := []otellog.KeyValue{
 		otellog.Int64("pid", int64(ev.PID)),
 		otellog.Int64("tid", int64(ev.TID)),
@@ -86,7 +105,8 @@ func (e *otelEmitter) emitSSLWrite(ev PacketEvent, payloadPreview string) {
 		otellog.Int64("orig_len", int64(ev.OrigLen)),
 		otellog.Int64("captured_len", int64(ev.CapturedLen)),
 		otellog.Bool("truncated", ev.Truncated),
-		otellog.String("hook", hookTypeLabel(ev.HookType)),
+		otellog.String("clawguard.version", ev.ClawguardVersion),
+		otellog.String("clawguard.commit", ev.ClawguardCommit),
 		otellog.String("container.id", ev.ContainerID),
 	}
 	if ev.PodName != "" {
@@ -99,30 +119,32 @@ func (e *otelEmitter) emitSSLWrite(ev PacketEvent, payloadPreview string) {
 	var record otellog.Record
 	record.SetTimestamp(ev.Timestamp)
 	record.SetObservedTimestamp(time.Now())
-	record.SetBody(otellog.StringValue(payloadPreview))
+	record.SetBody(otellog.StringValue(body))
 	record.SetSeverity(otellog.SeverityInfo)
-	record.SetSeverityText("INFO")
 	record.AddAttributes(attrs...)
 
 	emitCtx := context.Background()
-	if tid, sid, ok := parseTraceparent(ev.Payload); ok {
+	if tid, sid, ok := parseTraceparent(string(ev.Payload)); ok {
 		record.AddAttributes(
 			otellog.String("trace_id", tid.String()),
 			otellog.String("span_id", sid.String()),
 		)
 		sc := trace.NewSpanContext(trace.SpanContextConfig{
-			TraceID:    tid,
-			SpanID:     sid,
-			TraceFlags: trace.FlagsSampled,
-			Remote:     true,
+			TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled, Remote: true,
 		})
 		emitCtx = trace.ContextWithSpanContext(context.Background(), sc)
 	}
-
-	e.logger.Emit(emitCtx, record)
+	s.logger.Emit(emitCtx, record)
+	return nil
 }
 
-// parseTraceparent extracts W3C traceparent from HTTP plaintext headers (best-effort).
+func (s *otelSink) Close() error {
+	if s.provider != nil {
+		return s.provider.Shutdown(context.Background())
+	}
+	return nil
+}
+
 func parseTraceparent(payload string) (trace.TraceID, trace.SpanID, bool) {
 	m := traceparentRe.FindStringSubmatch(payload)
 	if len(m) < 4 {

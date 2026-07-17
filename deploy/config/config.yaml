@@ -1,0 +1,16 @@
+plugin_dir: /var/lib/clawguard/plugins
+processors:
+  # OSS observational demo (async; does not block sinks)
+  - name: detect
+    mode: async
+    disabled: false
+  # Mutating gate — keep off in OSS default; commercial / compliance use
+  - name: mask
+    mode: sync
+    disabled: true
+sinks:
+  - name: file
+    settings:
+      path: /var/log/clawguard/plaintext.jsonl
+sink_queue: 256
+http_port: 8080

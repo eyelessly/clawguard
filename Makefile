@@ -37,6 +37,18 @@ endif
 IMAGE ?= clawguard:local
 PLATFORM ?= $(DOCKER_PLATFORM)
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+EDITION ?= oss
+LDFLAGS := -X clawguard/internal/version.Version=$(VERSION) \
+	-X clawguard/internal/version.Commit=$(COMMIT) \
+	-X clawguard/internal/version.BuildTime=$(BUILD_TIME) \
+	-X clawguard/internal/version.Edition=$(EDITION)
+
+PLUGINS := clawguard-sink-file clawguard-sink-otel clawguard-sink-debugws \
+	clawguard-processor-detect clawguard-processor-mask
+
 .PHONY: generate build clean docker-build docker-build-amd64 docker-build-arm64 docker-info
 
 # Little-endian BPF (amd64 + arm64). Set TARGET_BPF=bpfeb on big-endian hosts if needed.
@@ -48,15 +60,23 @@ generate:
 
 build: generate
 	mkdir -p bin
-	CGO_ENABLED=0 go build -o bin/clawguard ./cmd/clawguard
+	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/clawguard ./cmd/clawguard
+	@for p in $(PLUGINS); do \
+		CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/$$p ./cmd/$$p; \
+	done
 
 clean:
 	rm -f cmd/clawguard/ssl_write_bpfel.go cmd/clawguard/ssl_write_bpfeb.go
 	rm -f cmd/clawguard/ssl_write_bpfel.o cmd/clawguard/ssl_write_bpfeb.o
-	rm -f bin/clawguard
+	rm -rf bin/
 
 docker-build:
-	docker buildx build --load --platform $(PLATFORM) -t $(IMAGE) .
+	docker buildx build --load --platform $(PLATFORM) \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		--build-arg EDITION=$(EDITION) \
+		-t $(IMAGE) .
 
 docker-build-amd64:
 	$(MAKE) docker-build PLATFORM=linux/amd64
@@ -66,3 +86,4 @@ docker-build-arm64:
 
 docker-info:
 	@echo "ARCH=$(ARCH) DEB_ARCH=$(DEB_ARCH) DOCKER_PLATFORM=$(DOCKER_PLATFORM) PLATFORM=$(PLATFORM) IMAGE=$(IMAGE)"
+	@echo "VERSION=$(VERSION) COMMIT=$(COMMIT) EDITION=$(EDITION)"

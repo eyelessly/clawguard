@@ -9,3 +9,4 @@ cmd/clawguard/ssl_write_bpfeb.o
 
 roadmap/
 .vite/
+e2e/out/

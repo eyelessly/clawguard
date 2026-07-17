@@ -18,6 +18,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"clawguard/internal/config"
+	"clawguard/internal/event"
+	"clawguard/internal/pipeline"
+	"clawguard/internal/pluginhost"
+	"clawguard/internal/version"
+
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/docker/docker/api/types"
@@ -42,9 +48,10 @@ type sslEvent struct {
 }
 
 const (
-	maxChunkPayload = 512
-	maxCaptureBytes = 16384
-	reassemblyTTL   = 2 * time.Second
+	maxChunkPayload     = 512
+	defaultPreviewMax   = 16384
+	defaultChunkPoolMB  = 256
+	defaultReassemblyTTL = 30 * time.Second
 )
 
 type reassemblyKey struct {
@@ -58,13 +65,16 @@ type reassemblyState struct {
 	totalLen  uint32
 	truncated bool
 	fragCnt   uint32
-	frags     map[uint32][]byte
+	slots     *fragSlots
 	firstAt   time.Time
 	lastAt    time.Time
 }
 
 var debugLog = func(format string, args ...any) {}
-var logPayloadMaxBytes = maxCaptureBytes
+var logPayloadMaxBytes = defaultPreviewMax
+var reassemblyTTL = defaultReassemblyTTL
+var optionalMaxCaptureBytes uint32 // 0 = unlimited; pushed into BPF config_map
+var chunkPoolMB = defaultChunkPoolMB
 
 func init() {
 	if os.Getenv("CLAWGUARD_DEBUG") != "" {
@@ -73,31 +83,69 @@ func init() {
 		}
 	}
 	logPayloadMaxBytes = parseLogPayloadMax(os.Getenv("CLAWGUARD_PAYLOAD_PREVIEW_MAX"))
+	reassemblyTTL = parseDurationEnv("CLAWGUARD_REASSEMBLY_TTL", defaultReassemblyTTL)
+	optionalMaxCaptureBytes = parseOptionalMaxCapture(os.Getenv("CLAWGUARD_MAX_CAPTURE_BYTES"))
+	chunkPoolMB = parsePositiveIntEnv("CLAWGUARD_CHUNK_POOL_MB", defaultChunkPoolMB)
 }
 
 func parseLogPayloadMax(v string) int {
 	v = strings.TrimSpace(v)
 	if v == "" {
-		return maxCaptureBytes
+		return defaultPreviewMax
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		log.Printf("warning: CLAWGUARD_PAYLOAD_PREVIEW_MAX=%q invalid, fallback to %d", v, maxCaptureBytes)
-		return maxCaptureBytes
+		log.Printf("warning: CLAWGUARD_PAYLOAD_PREVIEW_MAX=%q invalid, fallback to %d", v, defaultPreviewMax)
+		return defaultPreviewMax
 	}
 	if n < 0 {
-		log.Printf("warning: CLAWGUARD_PAYLOAD_PREVIEW_MAX=%q negative, fallback to %d", v, maxCaptureBytes)
-		return maxCaptureBytes
+		log.Printf("warning: CLAWGUARD_PAYLOAD_PREVIEW_MAX=%q negative, fallback to %d", v, defaultPreviewMax)
+		return defaultPreviewMax
 	}
-	if n > maxCaptureBytes {
-		log.Printf("warning: CLAWGUARD_PAYLOAD_PREVIEW_MAX=%d exceeds cap %d, using %d", n, maxCaptureBytes, maxCaptureBytes)
-		return maxCaptureBytes
+	return n
+}
+
+func parseDurationEnv(name string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		log.Printf("warning: %s=%q invalid, fallback to %s", name, v, def)
+		return def
+	}
+	return d
+}
+
+func parseOptionalMaxCapture(v string) uint32 {
+	v = strings.TrimSpace(v)
+	if v == "" || v == "0" {
+		return 0
+	}
+	n, err := strconv.ParseUint(v, 10, 32)
+	if err != nil {
+		log.Printf("warning: CLAWGUARD_MAX_CAPTURE_BYTES=%q invalid, using unlimited", v)
+		return 0
+	}
+	return uint32(n)
+}
+
+func parsePositiveIntEnv(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		log.Printf("warning: %s=%q invalid, fallback to %d", name, v, def)
+		return def
 	}
 	return n
 }
 
 // parseLabelFilter parses CLAWGUARD_LABEL: comma-separated key=value pairs (AND).
-// Empty or unset env → nil slice (no filter). Example: `clawguard.monitor=true` or `a=1,b=2`.
+// Empty or unset env -> nil slice (no filter). Example: `clawguard.monitor=true` or `a=1,b=2`.
 func parseLabelFilter(env string) ([]labelPair, error) {
 	env = strings.TrimSpace(env)
 	if env == "" {
@@ -164,14 +212,15 @@ func logRuntimeContext() {
 	if fi, err := os.Stat("/sys/kernel/btf/vmlinux"); err == nil {
 		log.Printf("BTF: /sys/kernel/btf/vmlinux present (size=%d)", fi.Size())
 	} else {
-		log.Printf("BTF: /sys/kernel/btf/vmlinux stat (%v) — CO-RE features may vary", err)
+		log.Printf("WARNING: BTF missing (%v) — CO-RE / modern BPF load may fail; need /sys/kernel/btf/vmlinux", err)
 	}
 	if b, err := os.ReadFile("/proc/version"); err == nil {
 		log.Printf("/proc/version: %s", strings.TrimSpace(string(b)))
 	}
+	log.Printf("requirements: Linux ≥5.17 (bpf_loop), privileged CAP_BPF/uprobe")
 }
 
-// labelPair is one required Docker label (Config.Labels key → exact value).
+// labelPair is one required Docker label (Config.Labels key -> exact value).
 type labelPair struct {
 	key, val string
 }
@@ -182,10 +231,10 @@ type containerWatch struct {
 	metaByID        map[string]targetMeta
 	objs            *ssl_writeObjects
 	ringReader      *ringbuf.Reader
-	selfContainerID string      // 12- or 64-hex; skip attaching to ourselves (cgroup, hostname, or Docker API pid match)
-	labelPairs      []labelPair // empty = monitor all non-self; non-empty = AND match on container labels
-	hub             *hub
-	otel            *otelEmitter
+	selfContainerID string
+	labelPairs      []labelPair
+	pipe            *pipeline.Pipeline
+	pool            *ChunkPool
 }
 
 type attachSet struct {
@@ -204,23 +253,67 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.SetOutput(os.Stdout)
 
+	for _, a := range os.Args[1:] {
+		if a == "-version" || a == "--version" {
+			fmt.Printf("clawguard %s\n", version.String())
+			os.Exit(0)
+		}
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	log.Printf("clawguard %s", version.String())
+	setBuildInfo(version.Version, version.Commit, version.Edition)
 
 	if os.Geteuid() != 0 {
 		log.Println("warning: not running as root; eBPF uprobe attach usually requires privileges")
 	}
 	log.Printf("pid=%d CLAWGUARD_DEBUG=%q", os.Getpid(), os.Getenv("CLAWGUARD_DEBUG"))
 	log.Printf("CLAWGUARD_PAYLOAD_PREVIEW_MAX=%d (display-only cap)", logPayloadMaxBytes)
+	log.Printf("CLAWGUARD_REASSEMBLY_TTL=%s CLAWGUARD_CHUNK_POOL_MB=%d CLAWGUARD_MAX_CAPTURE_BYTES=%d (0=unlimited)",
+		reassemblyTTL, chunkPoolMB, optionalMaxCaptureBytes)
 	logRuntimeContext()
 
-	otelOut, err := initOTel(ctx)
+	cfg, err := config.Load("")
 	if err != nil {
-		log.Fatalf("otel: %v", err)
+		log.Fatalf("config: %v", err)
 	}
-	if otelOut != nil {
-		defer otelOut.shutdown(context.Background())
+	log.Printf("config plugin_dir=%s processors=%d sinks=%d", cfg.PluginDir, len(cfg.Processors), len(cfg.Sinks))
+
+	mgr := pluginhost.NewManager(cfg)
+	if err := mgr.Load(); err != nil {
+		log.Fatalf("plugins: %v", err)
 	}
+	refreshPluginMetrics(mgr)
+	pipe := pipeline.New(mgr, cfg.SinkQueue, recordSinkDrop)
+	pipe.Start(ctx)
+	defer pipe.Close()
+
+	// SIGHUP reloads config + plugins without tearing down eBPF.
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGHUP)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ch:
+				newCfg, err := config.Load("")
+				if err != nil {
+					log.Printf("SIGHUP config reload failed: %v", err)
+					continue
+				}
+				if err := mgr.Reload(newCfg); err != nil {
+					log.Printf("SIGHUP plugin reload failed: %v", err)
+					continue
+				}
+				pipe.AfterReload()
+				refreshPluginMetrics(mgr)
+				log.Printf("SIGHUP reload complete")
+			}
+		}
+	}()
 
 	objs := &ssl_writeObjects{}
 	log.Println("loading BPF collection (ssl_write + ssl_write_ex)...")
@@ -229,6 +322,9 @@ func main() {
 	}
 	defer objs.Close()
 	log.Println("BPF collection loaded OK")
+	if err := applyBPFCaptureConfig(objs); err != nil {
+		log.Printf("warning: apply BPF capture config: %v", err)
+	}
 
 	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
@@ -236,17 +332,20 @@ func main() {
 	}
 	defer rd.Close()
 
+	pool := newChunkPool(chunkPoolMB << 20)
+	log.Printf("chunk pool: %d slots (%d MiB)", pool.Cap(), chunkPoolMB)
+	setChunkPoolFree(pool.FreeApprox())
+
 	cw := &containerWatch{
 		byID:       make(map[string]*attachSet),
 		metaByID:   make(map[string]targetMeta),
 		objs:       objs,
 		ringReader: rd,
-		hub:        newHub(),
-		otel:       otelOut,
+		pipe:       pipe,
+		pool:       pool,
 	}
 
-	go cw.hub.run(ctx)
-	go startHTTPServer(ctx, cw.hub, 8080)
+	go startMetricsServer(ctx, cfg.HTTPPort)
 	go cw.readLoop(ctx)
 
 	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
@@ -264,6 +363,13 @@ func main() {
 	}
 
 	cw.runDockerMode(ctx)
+}
+
+func refreshPluginMetrics(mgr *pluginhost.Manager) {
+	resetPluginInfoMetrics()
+	for _, info := range mgr.Infos() {
+		setPluginInfoMetrics(info.Name, info.Kind, info.Version, info.Commit)
+	}
 }
 
 func (cw *containerWatch) runDockerMode(ctx context.Context) {
@@ -333,7 +439,7 @@ func (cw *containerWatch) runDockerMode(ctx context.Context) {
 
 // detectSelfContainerID returns 12- or 64-char hex so we can skip the manager container.
 // Cgroup works on many Linux hosts; Docker Desktop / linuxkit often has cgroup lines without
-// "docker-<id>" (e.g. only "0::/") — then use detectSelfViaDockerAPI after this returns "".
+// "docker-<id>" (e.g. only "0::/") - then use detectSelfViaDockerAPI after this returns "".
 func detectSelfContainerID() string {
 	if id := dockerIDFromCgroup(); id != "" {
 		debugLog("self id from /proc/self/cgroup: %s", shortID(id))
@@ -447,10 +553,16 @@ func dockerIDFromHostname() string {
 func (cw *containerWatch) readLoop(ctx context.Context) {
 	reassemblies := make(map[reassemblyKey]*reassemblyState)
 	lastCleanup := time.Now()
+	lastPoolGauge := time.Now()
 
 	for {
 		select {
 		case <-ctx.Done():
+			for _, st := range reassemblies {
+				if st.slots != nil {
+					st.slots.releaseAll(cw.pool)
+				}
+			}
 			return
 		default:
 		}
@@ -475,6 +587,7 @@ func (cw *containerWatch) readLoop(ctx context.Context) {
 		}
 		if ev.FragCnt == 0 || ev.FragIdx >= ev.FragCnt {
 			debugLog("drop invalid fragment pid=%d tid=%d call=%d frag=%d/%d", ev.PID, ev.TID, ev.CallID, ev.FragIdx, ev.FragCnt)
+			recordFragmentDrop()
 			continue
 		}
 		n := ev.ChunkLen
@@ -483,10 +596,11 @@ func (cw *containerWatch) readLoop(ctx context.Context) {
 		}
 		if n == 0 {
 			debugLog("drop empty fragment pid=%d tid=%d call=%d frag=%d/%d", ev.PID, ev.TID, ev.CallID, ev.FragIdx, ev.FragCnt)
+			recordFragmentDrop()
 			continue
 		}
-		payload := append([]byte(nil), ev.Payload[:n]...)
 
+		var poolIdx int
 		key := reassemblyKey{PID: ev.PID, TID: ev.TID, CallID: ev.CallID}
 		st := reassemblies[key]
 		if st == nil {
@@ -495,7 +609,7 @@ func (cw *containerWatch) readLoop(ctx context.Context) {
 				totalLen:  ev.TotalLen,
 				truncated: ev.Truncated != 0,
 				fragCnt:   ev.FragCnt,
-				frags:     make(map[uint32][]byte, ev.FragCnt),
+				slots:     newFragSlots(ev.FragCnt),
 				firstAt:   time.Now(),
 			}
 			reassemblies[key] = st
@@ -511,31 +625,32 @@ func (cw *containerWatch) readLoop(ctx context.Context) {
 			st.truncated = true
 		}
 
-		// Deduplicate dual-hook duplicates: same call_id + same fragment index + same bytes.
-		if prev, ok := st.frags[ev.FragIdx]; ok {
-			if bytes.Equal(prev, payload) {
-				debugLog("dedup fragment pid=%d tid=%d call=%d frag=%d hook=%d", ev.PID, ev.TID, ev.CallID, ev.FragIdx, ev.HookType)
-				goto maybeCleanup
-			}
-			// Keep first fragment for deterministic reassembly; record collision for debugging.
-			debugLog("fragment collision pid=%d tid=%d call=%d frag=%d old=%d new=%d", ev.PID, ev.TID, ev.CallID, ev.FragIdx, len(prev), len(payload))
+		if st.slots.has(ev.FragIdx) {
+			debugLog("dedup fragment pid=%d tid=%d call=%d frag=%d hook=%d", ev.PID, ev.TID, ev.CallID, ev.FragIdx, ev.HookType)
 			goto maybeCleanup
 		}
-		st.frags[ev.FragIdx] = payload
 
-		if uint32(len(st.frags)) == st.fragCnt {
-			var assembled bytes.Buffer
-			for i := uint32(0); i < st.fragCnt; i++ {
-				frag, ok := st.frags[i]
-				if !ok {
-					debugLog("missing fragment after complete-count pid=%d tid=%d call=%d idx=%d", ev.PID, ev.TID, ev.CallID, i)
-					goto maybeCleanup
-				}
-				assembled.Write(frag)
-			}
-			out := assembled.Bytes()
-			if st.totalLen > 0 && uint32(len(out)) > st.totalLen {
-				out = out[:st.totalLen]
+		poolIdx = cw.pool.Alloc(ev.Payload[:n])
+		if poolIdx < 0 {
+			debugLog("pool exhausted drop frag pid=%d tid=%d call=%d frag=%d/%d", ev.PID, ev.TID, ev.CallID, ev.FragIdx, ev.FragCnt)
+			recordFragmentDrop()
+			st.truncated = true
+			st.slots.releaseAll(cw.pool)
+			delete(reassemblies, key)
+			goto maybeCleanup
+		}
+		if !st.slots.put(ev.FragIdx, poolIdx, int(n)) {
+			cw.pool.Release(poolIdx)
+			goto maybeCleanup
+		}
+
+		if st.slots.complete() {
+			out := st.slots.assemble(cw.pool, st.totalLen)
+			st.slots.releaseAll(cw.pool)
+			delete(reassemblies, key)
+			if out == nil {
+				debugLog("assemble failed pid=%d tid=%d call=%d", ev.PID, ev.TID, ev.CallID)
+				goto maybeCleanup
 			}
 			log.Printf(
 				"pid=%d tid=%d call=%d reassembled_len=%d orig_len=%d captured_len=%d truncated=%t frags=%d payload=%q",
@@ -545,29 +660,31 @@ func (cw *containerWatch) readLoop(ctx context.Context) {
 			recordSSLWrite(ev.HookType, st.truncated, len(out))
 
 			containerID, meta := cw.lookupTargetByPID(ev.PID)
-			pkt := PacketEvent{
+			payloadCopy := append([]byte(nil), out...)
+			cev := &event.CaptureEvent{
 				Timestamp:    time.Now(),
 				PID:          ev.PID,
 				TID:          ev.TID,
 				CallID:       ev.CallID,
 				OrigLen:      st.origLen,
-				CapturedLen:  st.totalLen,
+				CapturedLen:  uint32(len(out)),
 				Truncated:    st.truncated,
 				HookType:     ev.HookType,
-				Payload:      sanitizeUTF8(out),
+				Payload:      payloadCopy,
 				ContainerID:  containerID,
 				PodName:      meta.podName,
 				PodNamespace: meta.podNamespace,
 			}
-			broadcastPacket(cw.hub, pkt)
-			if cw.otel != nil {
-				cw.otel.emitSSLWrite(pkt, formatPayloadForLog(out))
+			if cw.pipe != nil {
+				cw.pipe.Emit(cev)
 			}
-
-			delete(reassemblies, key)
 		}
 
 	maybeCleanup:
+		if time.Since(lastPoolGauge) >= 5*time.Second {
+			setChunkPoolFree(cw.pool.FreeApprox())
+			lastPoolGauge = time.Now()
+		}
 		if time.Since(lastCleanup) < time.Second {
 			continue
 		}
@@ -576,12 +693,35 @@ func (cw *containerWatch) readLoop(ctx context.Context) {
 			if now.Sub(v.lastAt) <= reassemblyTTL {
 				continue
 			}
-			log.Printf("reassembly timeout pid=%d tid=%d call=%d have=%d/%d first_seen_ms=%d", k.PID, k.TID, k.CallID, len(v.frags), v.fragCnt, now.Sub(v.firstAt).Milliseconds())
+			have := 0
+			if v.slots != nil {
+				have = v.slots.haveCount()
+				v.slots.releaseAll(cw.pool)
+			}
+			log.Printf("reassembly timeout pid=%d tid=%d call=%d have=%d/%d first_seen_ms=%d", k.PID, k.TID, k.CallID, have, v.fragCnt, now.Sub(v.firstAt).Milliseconds())
 			recordReassemblyTimeout()
 			delete(reassemblies, k)
 		}
 		lastCleanup = now
 	}
+}
+
+// applyBPFCaptureConfig writes optional max-capture into BPF config_map[0].
+func applyBPFCaptureConfig(objs *ssl_writeObjects) error {
+	if objs == nil || objs.ConfigMap == nil {
+		return fmt.Errorf("config_map missing")
+	}
+	var key uint32
+	val := optionalMaxCaptureBytes
+	if err := objs.ConfigMap.Put(key, val); err != nil {
+		return err
+	}
+	if val == 0 {
+		log.Printf("BPF capture: unlimited (CLAWGUARD_MAX_CAPTURE_BYTES unset)")
+	} else {
+		log.Printf("BPF capture: max %d bytes (safety valve)", val)
+	}
+	return nil
 }
 
 func sanitizeUTF8(b []byte) string {
@@ -695,7 +835,7 @@ func (cw *containerWatch) attachContainer(ctx context.Context, cli *client.Clien
 	cw.attachUprobes(ctx, containerID, rootPID, targetMeta{})
 }
 
-// attachUprobes discovers libssl (or node fallback) under /proc/<pid>/root and attaches uprobes.
+// attachUprobes discovers libssl and/or Go crypto/tls under the target and attaches uprobes.
 func (cw *containerWatch) attachUprobes(ctx context.Context, containerID string, rootPID int, meta targetMeta) {
 	cw.mu.Lock()
 	if _, ok := cw.byID[containerID]; ok {
@@ -706,14 +846,50 @@ func (cw *containerWatch) attachUprobes(ctx context.Context, containerID string,
 	}
 	cw.mu.Unlock()
 
+	wantOpenSSL, wantGo := parseRuntimes(os.Getenv("CLAWGUARD_RUNTIMES"))
+	var links []link.Link
+	var attached []string
+
+	if wantOpenSSL {
+		ls, err := cw.attachOpenSSL(ctx, containerID, rootPID)
+		if err != nil {
+			debugLog("openssl attach container=%s: %v", shortID(containerID), err)
+		} else {
+			links = append(links, ls...)
+			attached = append(attached, "openssl")
+		}
+	}
+	if wantGo {
+		gl, err := cw.attachGoTLS(containerID, rootPID)
+		if err != nil {
+			debugLog("go tls attach container=%s: %v", shortID(containerID), err)
+		} else if gl != nil {
+			links = append(links, gl)
+			attached = append(attached, "go")
+		}
+	}
+
+	if len(links) == 0 {
+		log.Printf("container %s: no runtime hooks attached (openssl=%v go=%v)", shortID(containerID), wantOpenSSL, wantGo)
+		recordAttachError()
+		return
+	}
+	log.Printf("attached runtimes=%v container=%s", attached, shortID(containerID))
+	cw.registerAttach(containerID, meta, links...)
+}
+
+func (cw *containerWatch) attachOpenSSL(ctx context.Context, containerID string, rootPID int) ([]link.Link, error) {
 	var lib string
 	var discoverErr error
-	const maxAttempts = 20
+	maxAttempts := 20
+	if _, wantGo := parseRuntimes(os.Getenv("CLAWGUARD_RUNTIMES")); wantGo {
+		maxAttempts = 4 // fail fast when Go runtime is also enabled
+	}
 	const delay = 150 * time.Millisecond
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		select {
 		case <-ctx.Done():
-			return
+			return nil, ctx.Err()
 		default:
 		}
 		lib, discoverErr = discoverLibSSLUnderProcRoot(rootPID)
@@ -727,55 +903,41 @@ func (cw *containerWatch) attachUprobes(ctx context.Context, containerID string,
 		if nodeExe, nodeErr := discoverNodeExecutableUnderProcRoot(rootPID); nodeErr == nil && nodeExe != "" {
 			exe, err := link.OpenExecutable(nodeExe)
 			if err != nil {
-				log.Printf("container %s: open node executable %s: %v", shortID(containerID), nodeExe, err)
-				recordAttachError()
-				return
+				return nil, err
 			}
 			lw, err := exe.Uprobe("SSL_write", cw.objs.ProbeSslWrite, nil)
 			if err != nil {
-				log.Printf("container %s: uprobe SSL_write on node %s: %v", shortID(containerID), nodeExe, err)
-				recordAttachError()
-				return
+				return nil, err
 			}
 			lex, err := exe.Uprobe("SSL_write_ex", cw.objs.ProbeSslWriteEx, nil)
 			if err != nil {
 				_ = lw.Close()
-				log.Printf("container %s: uprobe SSL_write_ex on node %s: %v", shortID(containerID), nodeExe, err)
-				recordAttachError()
-				return
+				return nil, err
 			}
-			log.Printf("attached SSL_write + SSL_write_ex uprobes on node executable: container=%s exe=%s", shortID(containerID), nodeExe)
-			cw.registerAttach(containerID, meta, lw, lex)
-			return
+			log.Printf("attached SSL_write + SSL_write_ex on node executable: container=%s exe=%s", shortID(containerID), nodeExe)
+			return []link.Link{lw, lex}, nil
 		}
-
-		log.Printf("container %s: no libssl.so under /proc/%d/root (and no node executable fallback): %v", shortID(containerID), rootPID, discoverErr)
-		recordAttachError()
-		return
+		if discoverErr != nil {
+			return nil, discoverErr
+		}
+		return nil, fmt.Errorf("libssl not found")
 	}
 
 	exe, err := link.OpenExecutable(lib)
 	if err != nil {
-		log.Printf("container %s: open %s: %v", shortID(containerID), lib, err)
-		recordAttachError()
-		return
+		return nil, err
 	}
-
 	lw, err := exe.Uprobe("SSL_write", cw.objs.ProbeSslWrite, nil)
 	if err != nil {
-		log.Printf("container %s: uprobe SSL_write on %s: %v", shortID(containerID), lib, err)
-		recordAttachError()
-		return
+		return nil, err
 	}
 	lex, err := exe.Uprobe("SSL_write_ex", cw.objs.ProbeSslWriteEx, nil)
 	if err != nil {
 		_ = lw.Close()
-		log.Printf("container %s: uprobe SSL_write_ex on %s: %v", shortID(containerID), lib, err)
-		recordAttachError()
-		return
+		return nil, err
 	}
-	log.Printf("attached SSL_write + SSL_write_ex uprobes (all PIDs using this lib): container=%s lib=%s", shortID(containerID), lib)
-	cw.registerAttach(containerID, meta, lw, lex)
+	log.Printf("attached SSL_write + SSL_write_ex: container=%s lib=%s", shortID(containerID), lib)
+	return []link.Link{lw, lex}, nil
 }
 
 func (cw *containerWatch) registerAttach(containerID string, meta targetMeta, links ...link.Link) {

@@ -239,7 +239,7 @@ func (cw *containerWatch) attachByContainerID(ctx context.Context, containerID s
 	pid, err := findPIDByContainerID(containerID)
 	if err != nil {
 		debugLog("k8s attach: pid for %s: %v (retry shortly)", shortID(containerID), err)
-		// Retry a few times — container may have just started.
+		// Retry a few times - container may have just started.
 		const maxAttempts = 30
 		for attempt := 0; attempt < maxAttempts; attempt++ {
 			select {

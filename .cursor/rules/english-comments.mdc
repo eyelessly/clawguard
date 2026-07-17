@@ -1,0 +1,12 @@
+---
+description: Code comments must be written in English only
+globs: "**/*.{go,c,h,js,jsx,ts,tsx}"
+alwaysApply: true
+---
+
+# English-only code comments
+
+- All comments in source files (line comments, block comments, godoc) must be **English**.
+- Do not use Chinese or other non-English languages in comments.
+- Prefer plain ASCII punctuation in comments (`...`, `->`) when practical.
+- User-facing docs (`README.md`, `docs/`, `roadmap/`) may use other languages when the project already does; this rule applies to **code comments only**.

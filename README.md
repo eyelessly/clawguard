@@ -2,22 +2,39 @@
 
 ![ClawGuard](clawguard-logo.png)
 
-**Cloud-native eBPF sidecar for AI agent observability** — capture TLS plaintext *before encryption* (OpenSSL `SSL_write` / `SSL_write_ex`) from outside the agent image. No MITM, no agent Dockerfile changes.
+**Cloud-native eBPF sidecar that observes AI-agent TLS plaintext from outside the container** — hooks OpenSSL and Go `crypto/tls` *before encryption*, with no MITM, no agent image changes, and no rewrite of the live write buffer.
 
-Primary ops surface: **Prometheus metrics + Grafana**. Optional: **OpenTelemetry Logs** and a local **Debug Console**.
+ClawGuard is an **observe-and-persist** tool: it captures full logical writes, exports them through hot-loaded plugins (default: JSONL file), and exposes Prometheus metrics for ops. It does **not** modify what the agent sends on the wire and does **not** block connections.
 
 ---
 
-## Quick Start (recommended): Kubernetes + Grafana
+## Capabilities (what works today)
 
-### 1. Deploy the DaemonSet
+| Capability | Detail |
+|------------|--------|
+| **TLS plaintext capture** | Uprobes on OpenSSL `SSL_write` / `SSL_write_ex` and Go 1.21+ `crypto/tls.(*Conn).Write` (amd64/arm64) |
+| **Full write reassembly** | Streaming `bpf_loop` + userspace chunk pool; default **unlimited** per logical write (optional `CLAWGUARD_MAX_CAPTURE_BYTES` safety valve). Verified end-to-end at ≥2MiB |
+| **Zero agent change** | Select targets by Docker **label** or Kubernetes **annotation**; privileged DaemonSet / sidecar style deploy |
+| **Persist plaintext** | Default **file sink** (also the **plugin reference example**) → JSONL at `/var/log/clawguard/plaintext.jsonl`. See [`cmd/clawguard-sink-file`](cmd/clawguard-sink-file) |
+| **Ops metrics** | Prometheus `:8080/metrics` + Grafana dashboard JSON |
+| **Hot-load plugins** | Out-of-process sinks/processors (JSON RPC). Ship extra binaries into `plugin_dir`; **SIGHUP** reloads without detaching eBPF |
+| **Observational detect** | Default-on async `detect` processor (side-path; does not block capture or file sink) |
+| **Optional exports** | OTLP logs (`otel` sink), debug Web UI (`debugws` on `:8081`) |
+
+**Not in scope of this tree:** changing SSL buffers in place, TCP RST / traffic blocking, or bundled commercial storage backends. Those are separate extensions via the [plugin contract](docs/plugin-contract.md).
+
+---
+
+## Quick Start (Kubernetes + Grafana)
+
+### 1. Deploy
 
 ```bash
 kubectl apply -f deploy/kubernetes/rbac.yaml
 kubectl apply -f deploy/kubernetes/daemonset.yaml
 ```
 
-ClawGuard watches Pods on each node with annotation:
+Monitor Pods with:
 
 ```yaml
 metadata:
@@ -27,91 +44,106 @@ metadata:
 
 See [`deploy/kubernetes/example-monitored-pod.yaml`](deploy/kubernetes/example-monitored-pod.yaml).
 
-### 2. Scrape `/metrics`
+### 2. Scrape metrics
 
-Each DaemonSet pod exposes Prometheus metrics on **`:8080/metrics`** (Service annotations included for common scrape setups).
+`:8080/metrics` — key series:
 
-| Metric | Type | Meaning |
-|--------|------|---------|
-| `clawguard_ssl_writes_total` | Counter | Reassembled SSL writes (`hook`, `truncated`) |
-| `clawguard_ssl_write_bytes_total` | Counter | Captured plaintext bytes |
-| `clawguard_reassembly_timeouts_total` | Counter | Dropped incomplete reassemblies |
-| `clawguard_attached_targets` | Gauge | Currently attached targets |
-| `clawguard_attach_errors_total` | Counter | Discover/attach failures |
+| Metric | Meaning |
+|--------|---------|
+| `clawguard_ssl_writes_total` | Reassembled writes (`hook`, `truncated`) |
+| `clawguard_ssl_write_bytes_total` | Captured plaintext bytes |
+| `clawguard_attached_targets` | Active uprobe targets |
+| `clawguard_build_info` / `clawguard_plugin_info` | Host / plugin versions |
+| `clawguard_sink_dropped_total` | Sink or async-processor queue drops |
 
-### 3. Import the official Grafana dashboard
+Import [`deploy/grafana/clawguard-dashboard.json`](deploy/grafana/clawguard-dashboard.json).
 
-Import [`deploy/grafana/clawguard-dashboard.json`](deploy/grafana/clawguard-dashboard.json) into Grafana (Prometheus datasource). Panels cover write rate, bytes/sec, attached targets, timeouts, and attach errors.
+### 3. Optional OTLP
 
-### 4. Optional: OpenTelemetry Logs
-
-Set on the DaemonSet:
-
-```yaml
-- name: OTEL_EXPORTER_OTLP_ENDPOINT
-  value: http://otel-collector:4318
-- name: OTEL_SERVICE_NAME
-  value: clawguard
-- name: OTEL_EXPORTER_OTLP_INSECURE
-  value: "1"
-```
-
-Each reassembled write becomes an OTLP **Log** (body = payload preview). If the HTTP plaintext contains a W3C `traceparent` header, ClawGuard attaches `trace_id` / `span_id` (best-effort user-space parse; eBPF-native Trace ID extraction is a later enhancement).
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` (enables the `otel` sink plugin).
 
 ---
 
-## What ClawGuard does
-
-[**OpenClaw**](https://openclaw.ai/), [**nanobot**](https://github.com/HKUDS/nanobot), and similar agent stacks often run in containers with tools, API keys, and user context — and can leak PII or credentials over HTTPS. ClawGuard gives operators a **zero-intrusive** view of plaintext about to hit TLS.
-
-- Hooks **OpenSSL** inside selected containers/Pods (`SSL_write` / `SSL_write_ex`).
-- **No TLS MITM**, no extra CA, no agent source changes.
-- Selection: Docker **labels** or Kubernetes **annotations**.
-- Runtime: **Linux** only (host or Docker Desktop VM). Needs privileged eBPF.
-
----
-
-## Docker Compose / single-host
+## Docker / single-host
 
 ```bash
 docker pull eyelessly/clawguard:latest
+mkdir -p ./clawguard-logs
 docker rm -f clawguard 2>/dev/null
 docker run -d --name clawguard \
   --privileged --pid=host \
   -p 8080:8080 \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$(pwd)/clawguard-logs:/var/log/clawguard" \
   -e CLAWGUARD_LABEL=clawguard.monitor=true \
   -e CLAWGUARD_DEBUG_UI=0 \
   eyelessly/clawguard:latest
 ```
 
-Label agents:
+Then:
 
 ```bash
+# labeled workload
 docker run --label clawguard.monitor=true ...
-```
 
-Verify metrics:
-
-```bash
 curl -s localhost:8080/metrics | grep clawguard_
+ls -lh ./clawguard-logs/plaintext.jsonl   # full captured plaintext (JSONL)
 ```
 
-Smoke test:
+E2E (Go/BPF compile **only inside Docker**):
 
 ```bash
-docker run --rm --label clawguard.monitor=true python:3.11-slim bash -ec '
-  pip install -q requests
-  python -c "import requests; requests.post(\"https://httpbin.org/post\", data=\"MY_SECRET_PASSWORD_123\")"
-'
+./e2e/docker/run.sh          # OpenSSL smoke + file sink
+./e2e/docker/run_large.sh    # ≥2MiB full body in e2e/out/large/plaintext.jsonl
+./e2e/docker/run_go_tls.sh   # static Go crypto/tls
 ```
 
-### Local Debug Console
+---
 
-The built-in Wireshark-style UI is optional for single-machine debugging:
+## How it fits together
 
-- Default: UI + WebSocket on `:8080` (in addition to `/metrics`).
-- Production / K8s: set `CLAWGUARD_DEBUG_UI=0` to serve only `/metrics`.
+```
+Agent container                    ClawGuard host
+───────────────                    ─────────────
+SSL_write / Go TLS Write
+        │
+        ▼ uprobe (read-only copy)
+   BPF ringbuf ──► reassembly ──► pipeline
+                                      │
+                         sync processors (optional mask)
+                                      │
+                    ┌─────────────────┼─────────────────┐
+                    ▼                 ▼                 ▼
+               file sink         otel sink         async detect
+               (JSONL)           (OTLP)            (observe only)
+```
+
+- Capture path never waits on slow sinks (bounded queues; drops counted in metrics).
+- Async processors (default `detect`) run on a side path after the event is queued to sinks.
+- Requirements: **Linux ≥ 5.17** (`bpf_loop`), BTF (`/sys/kernel/btf/vmlinux`), privileged eBPF.
+
+Default pipeline config: [`deploy/config/config.yaml`](deploy/config/config.yaml).
+
+---
+
+## Plugins
+
+| Binary | Role |
+|--------|------|
+| `clawguard` | Host: eBPF, reassembly, plugin manager, `/metrics` |
+| `clawguard-sink-file` | **Reference sink example** — plaintext JSONL (default on). Source: [`cmd/clawguard-sink-file`](cmd/clawguard-sink-file) |
+| `clawguard-sink-otel` | OTLP logs |
+| `clawguard-sink-debugws` | Debug UI/WS (default listen `:8081`) |
+| `clawguard-processor-detect` | Async observational rules (default on) |
+| `clawguard-processor-mask` | Sync storage-side mask (default **off**) |
+
+To build your own sink, copy the file-sink example and follow [`docs/plugin-contract.md`](docs/plugin-contract.md).
+
+- Plugin dir: `CLAWGUARD_PLUGIN_DIR` (`/var/lib/clawguard/plugins`)
+- Config: `CLAWGUARD_CONFIG` (`/etc/clawguard/config.yaml`)
+- `clawguard -version` / `<plugin> -version` for build identity
+
+Debug UI: enable `debugws` or `CLAWGUARD_DEBUG_UI=1` (metrics stay on `:8080`).
 
 ![ClawGuard UI](clawguard-ui.png)
 
@@ -121,22 +153,29 @@ The built-in Wireshark-style UI is optional for single-machine debugging:
 
 | Env | Default | Description |
 |-----|---------|-------------|
-| `CLAWGUARD_LABEL` | _(none)_ | Docker mode: `key=value` pairs (AND). Example: `clawguard.monitor=true` |
-| `CLAWGUARD_POD_ANNOTATION` | `clawguard.io/monitor=true` | K8s mode: single `key=value` annotation filter |
-| `NODE_NAME` | _(required in K8s)_ | Downward API node name |
-| `CLAWGUARD_DEBUG_UI` | on | Set `0` / `false` / `off` to disable UI/WS |
-| `CLAWGUARD_DEBUG` | _(off)_ | Verbose attach/reassembly logs |
-| `CLAWGUARD_PAYLOAD_PREVIEW_MAX` | `16384` | Log/OTel body preview cap |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | _(empty = off)_ | Enable OTLP HTTP log export |
-| `OTEL_SERVICE_NAME` | `clawguard` | OTel resource service name |
-| `OTEL_EXPORTER_OTLP_INSECURE` | _(off)_ | Allow plain HTTP to collector |
-| `DOCKER_HOST` | `unix:///var/run/docker.sock` | Docker engine endpoint |
+| `CLAWGUARD_CONFIG` | `/etc/clawguard/config.yaml` | Pipeline YAML |
+| `CLAWGUARD_PLUGIN_DIR` | `/var/lib/clawguard/plugins` | Plugin binaries |
+| `CLAWGUARD_PLAINTEXT_LOG` | _(config)_ | Override file sink path |
+| `CLAWGUARD_LABEL` | _(none)_ | Docker `key=value` AND filter |
+| `CLAWGUARD_POD_ANNOTATION` | `clawguard.io/monitor=true` | K8s annotation filter |
+| `CLAWGUARD_RUNTIMES` | `openssl,go` | Which hooks to attach |
+| `CLAWGUARD_MAX_CAPTURE_BYTES` | `0` (unlimited) | Optional capture size cap |
+| `CLAWGUARD_CHUNK_POOL_MB` | `256` | Userspace fragment pool |
+| `CLAWGUARD_REASSEMBLY_TTL` | `30s` | Incomplete reassembly timeout |
+| `CLAWGUARD_PAYLOAD_PREVIEW_MAX` | `16384` | Stdout log preview only |
+| `CLAWGUARD_DEBUG_UI` | _(config)_ | `1` / `0` toggles debugws |
+| `CLAWGUARD_DEBUG` | _(off)_ | Verbose host logs |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | _(empty)_ | Enables otel sink |
+| `NODE_NAME` | _(K8s)_ | Downward API node name |
+| `DOCKER_HOST` | `unix:///var/run/docker.sock` | Docker engine |
 
-Mode selection: if `KUBERNETES_SERVICE_HOST` is set → **Kubernetes**; otherwise → **Docker**.
+`KUBERNETES_SERVICE_HOST` set → Kubernetes mode; otherwise Docker mode.
 
 ---
 
-## Build from source
+## Build
+
+Shippable binary/image: compile **inside Docker** (BPF):
 
 ```bash
 docker build -t clawguard:local .
@@ -144,7 +183,7 @@ docker build -t clawguard:local .
 make docker-build IMAGE=clawguard:local
 ```
 
-Native Linux (requires `clang`, `llvm`, `libbpf-dev`, Go 1.22+):
+Native Linux (clang, llvm, libbpf-dev, Go 1.22+, BTF):
 
 ```bash
 make build
@@ -155,6 +194,9 @@ sudo ./bin/clawguard
 
 ## Limitations
 
-- **OpenSSL dynamic linking** (plus Node static-OpenSSL executable fallback). Not BoringSSL / typical static Go `crypto/tls`.
-- Capture capped at **16384 bytes** per logical write; reassembly TTL **2s**.
-- Trace correlation via plaintext `traceparent` only (no eBPF Trace ID extraction yet).
+- Not BoringSSL / Java SSLEngine; Node may use executable-symbol fallback when `libssl` is missing.
+- Go: **1.21+**, **amd64/arm64**; unstripped / pclntab-available binaries preferred.
+- Per-write ceiling is effectively the kernel `bpf_loop` budget (~512MiB at 512B chunks), not a 16KB product cap.
+- Under backpressure (pool / ringbuf / TTL / full sink queues), events can drop or be marked `truncated`.
+- Trace correlation uses plaintext `traceparent` when present (no eBPF Trace ID extraction yet).
+- **Passive only**: does not alter or block the agent’s TLS send path.
